@@ -1,9 +1,39 @@
 cmake_minimum_required (VERSION 3.16.3)
 
+# JKU: set vcpkg configuration
+if(NOT CMAKE_TOOLCHAIN_FILE)
+    if(APPLE)
+        if(APPLE_TARGET_ARCHITECTURE STREQUAL "x86_64")
+            if("$ENV{SAMARAI_VCPKG_ROOT_X64}" STREQUAL "")
+                message(FATAL_ERROR "Build requires vcpkg_x64. Set the SAMARAI_VCPKG_ROOT_X64 environment variable.")
+            endif()
+            set(VCPKG_EXPECTED_PATH "$ENV{SAMARAI_VCPKG_ROOT_X64}/scripts/buildsystems/vcpkg.cmake")
+            set(VCPKG_TARGET_TRIPLET "x64-osx-static")
+        else()
+            if("$ENV{SAMARAI_VCPKG_ROOT}" STREQUAL "")
+                message(FATAL_ERROR "Build requires vcpkg. Set the SAMARAI_VCPKG_ROOT environment variable.")
+            endif()
+            set(VCPKG_EXPECTED_PATH "$ENV{SAMARAI_VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+            set(VCPKG_TARGET_TRIPLET "arm64-osx-static")
+        endif()
+    else()
+        if("$ENV{SAMARAI_VCPKG_ROOT}" STREQUAL "")
+            message(FATAL_ERROR "Build requires vcpkg. Set the SAMARAI_VCPKG_ROOT environment variable.")
+        endif()
+        set(VCPKG_EXPECTED_PATH "$ENV{SAMARAI_VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+    endif()
+    if(NOT EXISTS "${VCPKG_EXPECTED_PATH}")
+        message(FATAL_ERROR "SAMARAI_VCPKG_ROOT is set to '$ENV{SAMARAI_VCPKG_ROOT}' but the toolchain file was not found at '${VCPKG_EXPECTED_PATH}'.\nCheck your VCPKG_ROOT path or vcpkg installation.")
+    endif()
+    set(CMAKE_TOOLCHAIN_FILE "${VCPKG_EXPECTED_PATH}" CACHE FILEPATH "Path to vcpkg.cmake")
+endif()
+
 project(mailio VERSION 0.26.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+message("${VCPKG_EXPECTED_PATH}")
 
 if(NOT DEFINED LIB_SUFFIX)
   set(LIB_SUFFIX "" CACHE STRING "Suffix for installed library path. Ex. 64 for lib64")
@@ -178,6 +208,11 @@ install(DIRECTORY include/mailio DESTINATION ${INCLUDE_INSTALL_DIR})
 
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
+
+# JKU: set windows min version or we get warnings on msvc. We set to Windows 10 (0x0A00)
+if(WIN32)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE _WIN32_WINNT=0x0A00)
+endif()
 
 # Target
 install(TARGETS ${PROJECT_NAME}

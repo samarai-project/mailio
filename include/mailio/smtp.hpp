@@ -51,7 +51,7 @@ public:
       mechanism is allowed.
     - LOGIN: The username and password are sent in Base64 format.
     **/
-    enum class auth_method_t {NONE, LOGIN};
+    enum class auth_method_t {NONE, LOGIN, XOAUTH2 };
 
     /**
     Making a connection to the server.
@@ -163,6 +163,7 @@ protected:
     @throw *          `parse_line(const string&)`, `dialog::send(const string&)`, `dialog::receive()`.
     **/
     void auth_login(const std::string& username, const std::string& password);
+    void auth_login_xoauth2(const std::string &username, const std::string &access_token);
 
     /**
     Issuing `EHLO` and/or `HELO` commands.
@@ -272,7 +273,7 @@ public:
     - LOGIN: The username and password are sent in Base64 format.
     - START_TLS: For the TCP connection, a TLS negotiation is asked before sending the login parameters.
     **/
-    enum class auth_method_t {NONE, LOGIN, START_TLS};
+    enum class auth_method_t {NONE, LOGIN, START_TLS, XOAUTH2, START_TLS_XOAUTH2};
 
     /**
     Making a connection to the server.

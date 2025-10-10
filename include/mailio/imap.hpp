@@ -118,7 +118,7 @@ public:
     The following mechanisms are allowed:
     - LOGIN: The username and password are sent in plain format.
     **/
-    enum class auth_method_t {LOGIN};
+    enum class auth_method_t {LOGIN, XOAUTH2};
 
     /**
     Single message ID or range of message IDs to be searched for.
@@ -663,6 +663,7 @@ protected:
     @todo             Add server error messages to exceptions.
     **/
     void auth_login(const std::string& username, const std::string& password);
+    void auth_login_xoauth2(const std::string &username, const std::string &access_token);
 
     /**
     Searching a mailbox.
@@ -931,7 +932,7 @@ public:
     - LOGIN: The username and password are sent in plain format.
     - START_TLS: For the TCP connection, a TLS negotiation is asked before sending the login parameters.
     **/
-    enum class auth_method_t {LOGIN, START_TLS};
+    enum class auth_method_t {LOGIN, START_TLS, XOAUTH2, START_TLS_XOAUTH2 };
 
     /**
     Making a connection to the server.

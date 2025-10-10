@@ -27,7 +27,12 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 
 namespace mailio
 {
+    
+inline void debug_bugfix(const std::string& text) {
+    std::cout << "MAILIO [BUGFIX] " << text << "\n";
+}
 
+std::string b64_encode(const std::string& value);
 
 /**
 Dealing with network in a line oriented fashion.

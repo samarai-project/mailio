@@ -24,7 +24,8 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/regex.hpp>
-#include <mailio/imap.hpp>
+#include "mailio/imap.hpp"
+#include "mailio/base64.hpp"
 
 
 using std::find_if;
@@ -67,7 +68,6 @@ const string imap::RANGE_ALL{"*"};
 const string imap::LIST_SEPARATOR{","};
 const string imap::TOKEN_SEPARATOR_STR{" "};
 const string imap::QUOTED_STRING_SEPARATOR{"\""};
-
 
 string imap::messages_range_to_string(imap::messages_range_t id_pair)
 {
@@ -230,6 +230,8 @@ string imap::authenticate(const string& username, const string& password, auth_m
 
     if (method == auth_method_t::LOGIN)
         auth_login(username, password);
+    else if (method == auth_method_t::XOAUTH2)
+        auth_login_xoauth2(username, password);
     return greeting;
 }
 
@@ -982,6 +984,77 @@ void imap::auth_login(const string& username, const string& password)
     }
 }
 
+void imap::auth_login_xoauth2(const std::string &username, const std::string &access_token)
+{
+    
+    // XOAUTH2 SASL initial client response as per RFC 7628 (and Google docs):
+    // base64("user=" user "\x01auth=Bearer " access_token "\x01\x01")
+    std::string sasl = "user=" + username + "\x01" + "auth=Bearer " + access_token + "\x01\x01";
+    std::string sasl_b64 = b64_encode(sasl);
+
+    // IMAP requires a tagged command: AUTHENTICATE XOAUTH2 <base64>
+    // (Unlike SMTP which may negotiate with numeric codes.)
+    dlg_->send(format("AUTHENTICATE XOAUTH2 " + sasl_b64));
+
+    // We expect one of:
+    // 1. Immediate tagged OK => success.
+    // 2. A continuation '+' with a base64 JSON error, then we must send an empty line to abort, then a tagged NO/BAD.
+    // 3. Direct tagged NO/BAD failure.
+    string error_b64;          
+    string response;          
+
+    bool done = false;
+    while (!done)
+    {
+        string line = dlg_->receive();
+        tag_result_response_t parsed_line = parse_tag_result(line);
+        if (parsed_line.tag == CONTINUE_RESPONSE)
+        {
+            // Continuation with base64 encoded JSON error.
+            error_b64 = parsed_line.response;
+            // Per XOAUTH2 failure flow, send empty line to abort.
+            try
+            {
+                dlg_->send("");
+            }
+            catch (...)
+            {
+                // ignore send failure here; we'll proceed to receive final tagged result
+            }
+            continue; // read final tagged response
+        }
+        else if (parsed_line.tag == UNTAGGED_RESPONSE)
+        {
+            // Ignore unrelated untagged responses during auth.
+            continue;
+        }
+        else if (parsed_line.tag == to_string(tag_))
+        {
+            // Tagged completion.
+            if (parsed_line.result.has_value() && parsed_line.result.value() == tag_result_response_t::OK)
+            {
+                return; // Success
+            }
+            // Failure path: collect final response text.
+            if (parsed_line.result.has_value())
+            {
+                response = line;
+            }            
+            done = true;
+        }
+        else
+        {
+            throw imap_error("Incorrect tag.", "Tag=`" + parsed_line.tag + "`.");
+        }
+    }
+
+    std::string details = std::string{"JSON={"}
+        + "\"error\": \"" + error_b64 + "\"," 
+        + "\"response\": \"" + response + "\"" 
+        + "}";
+
+    throw imap_error("Authentication rejection.", details);
+}
 
 void imap::search(const string& conditions, list<unsigned long>& results, bool want_uids)
 {
@@ -1438,6 +1511,16 @@ string imaps::authenticate(const string& username, const string& password, auth_
     {
         is_start_tls_ = true;
         greeting = imap::authenticate(username, password, imap::auth_method_t::LOGIN);
+    }
+    else if (method == auth_method_t::XOAUTH2)
+    {
+        is_start_tls_ = false;
+        greeting = imap::authenticate(username, password, imap::auth_method_t::XOAUTH2);
+    }
+    else if (method == auth_method_t::START_TLS_XOAUTH2)
+    {
+        is_start_tls_ = true;
+        greeting = imap::authenticate(username, password, imap::auth_method_t::XOAUTH2);
     }
     return greeting;
 }

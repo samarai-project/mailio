@@ -16,6 +16,7 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <mailio/dialog.hpp>
+#include <mailio/base64.hpp>
 
 
 using std::string;
@@ -44,6 +45,18 @@ namespace mailio
 
 boost::asio::io_context dialog::ios_;
 
+std::string b64_encode(const std::string& value)
+{
+    base64 b64(
+        static_cast<string::size_type>(codec::line_len_policy_t::RECOMMENDED),
+        static_cast<string::size_type>(codec::line_len_policy_t::RECOMMENDED)
+    );
+    auto enc_v = b64.encode(value);
+    std::stringstream res{};
+    for (size_t i = 0; i < enc_v.size(); ++i)
+        res << enc_v[i];
+    return res.str();
+}
 
 dialog::dialog(const string& hostname, unsigned port, milliseconds timeout) : std::enable_shared_from_this<dialog>(),
     hostname_(hostname), port_(port), socket_(make_shared<tcp::socket>(ios_)), timer_(make_shared<steady_timer>(ios_)),

@@ -1,2 +1,4 @@
-cmake -DMAILIO_BUILD_DOCUMENTATION=OFF -DMAILIO_BUILD_EXAMPLES=OFF -DMAILIO_BUILD_TESTS=OFF
+@echo off
+cls
+echo --- Refreshing Build ---
 cmake --build build --config Release -- /m

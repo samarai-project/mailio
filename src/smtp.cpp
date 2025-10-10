@@ -16,6 +16,7 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <stdexcept>
 #include <tuple>
 #include <algorithm>
+#include <cctype>
 #include <boost/asio/ip/host_name.hpp>
 #include <mailio/base64.hpp>
 #include <mailio/smtp.hpp>
@@ -81,6 +82,8 @@ string smtp::authenticate(const string& username, const string& password, auth_m
         ;
     else if (method == auth_method_t::LOGIN)
         auth_login(username, password);
+    else if (method == auth_method_t::XOAUTH2)
+        auth_login_xoauth2(username, password);
     return greeting;
 }
 
@@ -236,6 +239,58 @@ void smtp::auth_login(const string& username, const string& password)
         throw smtp_error("Password rejection.", std::get<2>(tokens));
 }
 
+void smtp::auth_login_xoauth2(const std::string &username, const std::string &access_token)
+{
+    
+    // XOAUTH2 SASL initial client response as per RFC 7628:
+    // base64("user=" user "\x01auth=Bearer " access_token "\x01\x01")
+    std::string sasl = "user=" + username + "\x01" + "auth=Bearer " + access_token + "\x01\x01";
+    std::string sasl_b64 = b64_encode(sasl);
+
+    // Send AUTH XOAUTH2 with the initial client response.
+    dlg_->send("AUTH XOAUTH2 " + sasl_b64);
+    string line = dlg_->receive();
+    tuple<int, bool, string> tokens = parse_line(line);
+
+    // Success path: server replies with 235 (2XX - positive completion)
+    if (positive_completion(std::get<0>(tokens)))
+        return;
+
+    auto code = std::get<0>(tokens);
+    auto error_b64 = std::get<2>(tokens);
+    int final_code{0};
+    std::string final_error_b64{};
+
+    // Some servers (e.g., Gmail on failure) respond with 334 and a base64 encoded JSON error.
+    if (positive_intermediate(std::get<0>(tokens)))
+    {
+        
+        // Abort per RFC by sending an empty line – server should respond with final 5XX (e.g., 535).
+        try
+        {
+            dlg_->send("");
+            line = dlg_->receive();
+            tokens = parse_line(line);
+            final_code = std::get<0>(tokens);
+            final_error_b64 = std::get<2>(tokens);
+        }
+        catch (...)
+        {
+            // ignore
+        }
+
+    }
+
+    std::string details = std::string{"JSON={"} 
+        + "\"code\": " + std::to_string(code) + "," 
+        + "\"error\": \"" + error_b64 + "\"," 
+        + "\"finalCode\": " + std::to_string(final_code) + "," 
+        + "\"final\": \"" + final_error_b64 + "\"" 
+        + "}";
+        
+    throw smtp_error("Authentication rejection.", details);
+    
+}
 
 void smtp::ehlo()
 {
@@ -360,6 +415,16 @@ string smtps::authenticate(const string& username, const string& password, auth_
     {
         is_start_tls_ = true;
         greeting = smtp::authenticate(username, password, smtp::auth_method_t::LOGIN);
+    }
+    else if (method == auth_method_t::XOAUTH2)
+    {
+        is_start_tls_ = false;
+        greeting = smtp::authenticate(username, password, smtp::auth_method_t::XOAUTH2);
+    }
+    else if (method == auth_method_t::START_TLS_XOAUTH2)
+    {
+        is_start_tls_ = true;
+        greeting = smtp::authenticate(username, password, smtp::auth_method_t::XOAUTH2);
     }
     return greeting;
 }

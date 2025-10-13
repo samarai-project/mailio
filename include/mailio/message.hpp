@@ -356,6 +356,26 @@ public:
     **/
     std::string message_id() const;
 
+    
+    void uid(unsigned long uid);
+    unsigned long uid() const;
+    
+    void sequence_no(unsigned long no);
+    unsigned long sequence_no() const;
+    
+    /**
+    Setting a deduplication hash (e.g., SHA-256) of the raw message content.
+
+    This value is intended to be computed at fetch time over the exact RFC 822 bytes
+    returned by the server and stored for downstream deduplication.
+    */
+    void dedupe_hash(const std::string& hash);
+
+    /**
+    Getting the deduplication hash if set, otherwise an empty string.
+    */
+    std::string dedupe_hash() const;
+    
     /**
     Adding the in-reply-to ID.
 
@@ -739,6 +759,10 @@ protected:
     **/
     std::string message_id_;
 
+    unsigned long sequence_no_;
+    unsigned long message_uid_;
+    std::string dedupe_hash_;
+    
     /**
     In reply to list of IDs.
     **/
@@ -763,6 +787,7 @@ protected:
     Other headers not included into the known ones.
     **/
     headers_t headers_;
+    
 };
 
 [[deprecated]]

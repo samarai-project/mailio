@@ -26,6 +26,7 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <boost/regex.hpp>
 #include "mailio/imap.hpp"
 #include "mailio/base64.hpp"
+#include "mailio/sha256.hpp"
 
 
 using std::find_if;
@@ -393,8 +394,9 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
     cmd.append("FETCH " + message_ids + TOKEN_SEPARATOR_STR + RFC822_TOKEN);
     dlg_->send(format(cmd));
 
-    // Stores messages as strings indexed by the messages number.
-    map<unsigned long, string> msg_str;
+    // stores [msg_str, uid_no, sequence_no, hash] indexed by sequence_no or uid_no
+    map<unsigned long, tuple<string, unsigned long, unsigned long, string>> msg_str;
+    
     // Flag whether the response line is the last one i.e. the tagged response.
     bool has_more = true;
     try
@@ -447,6 +449,11 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
 
                 if (literal_token != nullptr)
                 {
+                    // If no UID was found, but we asked for them, it's an error.
+                    if (is_uids && uid_no == 0)
+                    {
+                        throw imap_error("No UID when fetching a message.", "");
+                    }                    
                     // Loop to read string literal.
                     while (literal_state_ == string_literal_state_t::READING)
                     {
@@ -464,13 +471,23 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                         // There could be a parenthesized list after the string literal. Read it and do nothing.
                         parse_response(line);
                     }
-                    msg_str.emplace(is_uids ? uid_no : sequence_no, move(literal_token->literal));
-
-                    // If no UID was found, but we asked for them, it's an error.
-                    if (is_uids && uid_no == 0)
-                    {
-                        throw imap_error("No UID when fetching a message.", "");
-                    }
+                    // Capture the raw RFC 822 bytes of the message.
+                    string raw = move(literal_token->literal);
+                    // Compute a SHA-256 dedupe hash of the raw content, if openssl is available.
+                    string hash{};
+#if defined(MAILIO_HAVE_OPENSSL)
+                    hash = sha256_hex(raw);
+#endif
+                    // Add the messageto the msg map
+                    msg_str.emplace(
+                        is_uids ? uid_no : sequence_no,
+                        make_tuple(
+                            move(raw),
+                            uid_no,
+                            sequence_no,
+                            move(hash)
+                        )
+                    );
                 }
             }
             // The tagged response determines status and parses provided messages in `msg_str`.
@@ -483,7 +500,10 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                     {
                         message msg;
                         msg.line_policy(line_policy);
-                        msg.parse(ms.second);
+                        msg.parse(std::get<0>(ms.second));
+                        msg.uid(std::get<1>(ms.second));
+                        msg.sequence_no(std::get<2>(ms.second));
+                        msg.dedupe_hash(std::get<3>(ms.second));
                         found_messages.emplace(ms.first, move(msg));
                     }
                 }
@@ -991,7 +1011,7 @@ void imap::auth_login_xoauth2(const std::string &username, const std::string &ac
     // base64("user=" user "\x01auth=Bearer " access_token "\x01\x01")
     std::string sasl = "user=" + username + "\x01" + "auth=Bearer " + access_token + "\x01\x01";
     std::string sasl_b64 = b64_encode(sasl);
-
+debug_bugfix("sasl: " + sasl);
     // IMAP requires a tagged command: AUTHENTICATE XOAUTH2 <base64>
     // (Unlike SMTP which may negotiate with numeric codes.)
     dlg_->send(format("AUTHENTICATE XOAUTH2 " + sasl_b64));
@@ -1515,11 +1535,6 @@ string imaps::authenticate(const string& username, const string& password, auth_
     else if (method == auth_method_t::XOAUTH2)
     {
         is_start_tls_ = false;
-        greeting = imap::authenticate(username, password, imap::auth_method_t::XOAUTH2);
-    }
-    else if (method == auth_method_t::START_TLS_XOAUTH2)
-    {
-        is_start_tls_ = true;
         greeting = imap::authenticate(username, password, imap::auth_method_t::XOAUTH2);
     }
     return greeting;

@@ -36,7 +36,6 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <mailio/mime.hpp>
 #include <mailio/message.hpp>
 
-
 using std::string;
 #if defined(__cpp_char8_t)
 using std::u8string;
@@ -339,6 +338,35 @@ string message::message_id() const
     return message_id_;
 }
 
+void message::uid(unsigned long uid)
+{
+    message_uid_ = uid;
+}
+
+unsigned long message::uid() const
+{
+    return message_uid_;
+}
+
+void message::sequence_no(unsigned long no)
+{
+    sequence_no_ = no;
+}
+
+unsigned long message::sequence_no() const
+{
+    return sequence_no_;
+}
+
+void message::dedupe_hash(const std::string& hash)
+{
+    dedupe_hash_ = hash;
+}
+
+std::string message::dedupe_hash() const
+{
+    return dedupe_hash_;
+}
 
 void message::add_in_reply_to(const string& in_reply)
 {

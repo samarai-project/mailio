@@ -114,6 +114,7 @@ set(project_sources
     ${PROJECT_SOURCE_DIR}/src/quoted_printable.cpp
     ${PROJECT_SOURCE_DIR}/src/q_codec.cpp
     ${PROJECT_SOURCE_DIR}/src/smtp.cpp
+  ${PROJECT_SOURCE_DIR}/src/sha256.cpp
 )
 
 set(project_headers
@@ -132,6 +133,7 @@ set(project_headers
     ${PROJECT_SOURCE_DIR}/include/mailio/quoted_printable.hpp
     ${PROJECT_SOURCE_DIR}/include/mailio/q_codec.hpp
     ${PROJECT_SOURCE_DIR}/include/mailio/smtp.hpp
+  ${PROJECT_SOURCE_DIR}/include/mailio/sha256.hpp
 )
 
 # handle documentation
@@ -192,6 +194,7 @@ endif()
 if(OPENSSL_FOUND)
     target_include_directories(${PROJECT_NAME} PUBLIC ${OPENSSL_INCLUDE_DIR})
     target_link_libraries(${PROJECT_NAME} ${OPENSSL_LIBRARIES})
+    target_compile_definitions(${PROJECT_NAME} PUBLIC MAILIO_HAVE_OPENSSL)
 endif()
 
 if(MINGW)

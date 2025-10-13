@@ -273,7 +273,7 @@ public:
     - LOGIN: The username and password are sent in Base64 format.
     - START_TLS: For the TCP connection, a TLS negotiation is asked before sending the login parameters.
     **/
-    enum class auth_method_t {NONE, LOGIN, START_TLS, XOAUTH2, START_TLS_XOAUTH2};
+    enum class auth_method_t {NONE, LOGIN, START_TLS, XOAUTH2};
 
     /**
     Making a connection to the server.

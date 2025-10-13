@@ -421,11 +421,6 @@ string smtps::authenticate(const string& username, const string& password, auth_
         is_start_tls_ = false;
         greeting = smtp::authenticate(username, password, smtp::auth_method_t::XOAUTH2);
     }
-    else if (method == auth_method_t::START_TLS_XOAUTH2)
-    {
-        is_start_tls_ = true;
-        greeting = smtp::authenticate(username, password, smtp::auth_method_t::XOAUTH2);
-    }
     return greeting;
 }
 

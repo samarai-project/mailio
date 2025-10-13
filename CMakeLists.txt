@@ -80,8 +80,7 @@ option(MAILIO_BUILD_DOCUMENTATION "Turn on to build doxygen based documentation.
 option(MAILIO_BUILD_EXAMPLES "Turn on to build examples." ON)
 option(MAILIO_BUILD_TESTS "Turn on to build the tests." ON)
 option(MAILIO_DYN_LINK_TESTS "Turn on to dynamically link the tests." OFF)
-
-option(BUILD_SHARED_LIBS "Turn on to build mailio as a shared library. When off mailio is build as a static library." ON)
+option(MAILIO_TEST_HOOKS "Turn on test-only functionality." OFF)
 
 # add a dependent option to build latex documentation or not.
 include(CMakeDependentOption)
@@ -271,3 +270,7 @@ if(${MAILIO_BUILD_TESTS})
     file(GLOB TXTS "${PROJECT_SOURCE_DIR}/test/cv.txt")
     install(FILES ${TXTS} DESTINATION "${SHARE_INSTALL_DIR}/${PROJECT_NAME}/test/")
 endif(${MAILIO_BUILD_TESTS})
+
+if(${MAILIO_TEST_HOOKS})
+    target_compile_definitions(${PROJECT_NAME} PUBLIC MAILIO_TEST_HOOKS)
+endif(${MAILIO_TEST_HOOKS})

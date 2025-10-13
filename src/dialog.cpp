@@ -93,6 +93,16 @@ void dialog::connect()
 
 void dialog::send(const string& line)
 {
+#ifdef MAILIO_TEST_HOOKS
+    if (sim_error_count_ > 0 && (sim_error_ == simulated_error_t::SEND_FAIL || sim_error_ == simulated_error_t::TIMEOUT_SEND))
+    {
+        --sim_error_count_;
+        if (sim_error_ == simulated_error_t::SEND_FAIL)
+            throw dialog_error("Network sending error.", "Simulated failure");
+        if (sim_error_ == simulated_error_t::TIMEOUT_SEND)
+            throw dialog_error("Network sending timed out.", "Simulated timeout");
+    }
+#endif
     if (timeout_.count() == 0)
         send_sync(*socket_, line);
     else
@@ -103,6 +113,16 @@ void dialog::send(const string& line)
 // TODO: perhaps the implementation should be common with `receive_raw()`
 string dialog::receive(bool raw)
 {
+#ifdef MAILIO_TEST_HOOKS
+    if (sim_error_count_ > 0 && (sim_error_ == simulated_error_t::RECV_FAIL || sim_error_ == simulated_error_t::TIMEOUT_RECV))
+    {
+        --sim_error_count_;
+        if (sim_error_ == simulated_error_t::RECV_FAIL)
+            throw dialog_error("Network receiving error.", "Simulated failure");
+        if (sim_error_ == simulated_error_t::TIMEOUT_RECV)
+            throw dialog_error("Network receiving timed out.", "Simulated timeout");
+    }
+#endif
     if (timeout_.count() == 0)
         return receive_sync(*socket_, raw);
     else
@@ -308,5 +328,22 @@ string dialog_error::details() const
 {
     return details_;
 }
+
+#ifdef MAILIO_TEST_HOOKS
+void dialog::simulate_disconnect()
+{
+    error_code ec;
+    if (socket_)
+        socket_->shutdown(tcp::socket::shutdown_both, ec);
+    if (socket_)
+        socket_->close(ec);
+}
+
+void dialog::set_simulated_error(simulated_error_t err, int count)
+{
+    sim_error_ = err;
+    sim_error_count_ = count;
+}
+#endif
 
 } // namespace mailio

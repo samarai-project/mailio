@@ -89,6 +89,28 @@ public:
     **/
     virtual std::string receive(bool raw = false);
 
+#ifdef MAILIO_TEST_HOOKS
+
+    /**
+    Simulate a hard disconnect by closing the underlying socket.
+    Next send/receive will fail with a network error.
+    */
+    virtual void simulate_disconnect();
+
+    /**
+    Types of simulated errors to inject for testing.
+    */
+    enum class simulated_error_t { NONE, SEND_FAIL, RECV_FAIL, TIMEOUT_SEND, TIMEOUT_RECV };
+
+    /**
+    Configure a simulated error that will trigger for the next N matching operations.
+
+    @param err   Error type to simulate.
+    @param count How many times to apply the error (default 1).
+    */
+    void set_simulated_error(simulated_error_t err, int count = 1);
+#endif
+
 protected:
 
     /**
@@ -214,6 +236,11 @@ protected:
     Input stream associated to the buffer.
     **/
     std::shared_ptr<std::istream> istrm_;
+
+#ifdef MAILIO_TEST_HOOKS
+    simulated_error_t sim_error_ = simulated_error_t::NONE;
+    int sim_error_count_ = 0;
+#endif
 };
 
 

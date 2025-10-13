@@ -526,6 +526,30 @@ public:
     **/
     std::string folder_delimiter();
 
+    /**
+    Sending a NOOP command to verify the session is alive and to receive any pending updates.
+
+    The method sends the IMAP NOOP command, swallows any untagged responses (such as EXISTS, EXPUNGE, RECENT,
+    or FETCH updates), and returns when the tagged OK is received. If the server responds with NO/BAD or a
+    protocol parsing error occurs, an exception is thrown. Network errors propagate from the underlying dialog.
+
+    @throw imap_error If the server returns NO/BAD or if parsing fails.
+    */
+    void noop();
+
+#ifdef MAILIO_TEST_HOOKS
+public:
+   
+    /**
+    Test helper: simulate a transport disconnect on the underlying dialog.
+    */
+    void test_simulate_disconnect();
+
+    /** Configure a simulated dialog error for the next N operations. */
+    void test_set_simulated_error(dialog::simulated_error_t err, int count = 1);
+    
+#endif
+
 protected:
 
     /**

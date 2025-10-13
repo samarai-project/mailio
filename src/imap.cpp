@@ -425,8 +425,12 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
 
                 unsigned long uid_no = 0;
                 shared_ptr<response_token_t> literal_token = nullptr;
+                // Keep a reference to the FETCH data list to allow rescanning after reading a literal
+                shared_ptr<response_token_t> fetch_list_token = nullptr;
                 for (auto part : mandatory_part_)
                     if (part->token_type == response_token_t::token_type_t::LIST)
+                    {
+                        fetch_list_token = part;
                         for (auto token = part->parenthesized_list.begin(); token != part->parenthesized_list.end(); token++)
                             if ((*token)->token_type == response_token_t::token_type_t::ATOM)
                             {
@@ -443,17 +447,14 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                                     if (token == part->parenthesized_list.end() || (*token)->token_type != response_token_t::token_type_t::LITERAL)
                                         throw imap_error("No literal when fetching a message.", "");
                                     literal_token = *token;
-                                    break;
+                                    // Do not break here; keep scanning existing tokens for UID as well.
                                 }
                             }
+                    }
 
                 if (literal_token != nullptr)
                 {
-                    // If no UID was found, but we asked for them, it's an error.
-                    if (is_uids && uid_no == 0)
-                    {
-                        throw imap_error("No UID when fetching a message.", "");
-                    }                    
+                    // Read the literal payload possibly followed by additional list items (e.g., UID after RFC822 literal).
                     // Loop to read string literal.
                     while (literal_state_ == string_literal_state_t::READING)
                     {
@@ -471,12 +472,30 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                         // There could be a parenthesized list after the string literal. Read it and do nothing.
                         parse_response(line);
                     }
+                    // After reading the literal, rescan the FETCH data list for UID if it was placed after the literal.
+                    if (uid_no == 0 && fetch_list_token != nullptr)
+                    {
+                        for (auto token = fetch_list_token->parenthesized_list.begin(); token != fetch_list_token->parenthesized_list.end(); token++) {
+                            
+                            if ((*token)->token_type == response_token_t::token_type_t::ATOM && iequals((*token)->atom, "UID"))
+                            {
+                                token++;
+                                if (token == fetch_list_token->parenthesized_list.end())
+                                throw imap_error("No uid number when fetching a message.", "");
+                                uid_no = stoul((*token)->atom);
+                                break;
+                            }
+                        }
+                    }
+                    // If no UID was found but we used UID FETCH, signal an error now that the full response was parsed.
+                    if (is_uids && uid_no == 0)
+                        throw imap_error("No UID when fetching a message.", "");
                     // Capture the raw RFC 822 bytes of the message.
                     string raw = move(literal_token->literal);
                     // Compute a SHA-256 dedupe hash of the raw content, if openssl is available.
-                    string hash{};
+                    string dedupe_hash{};
 #if defined(MAILIO_HAVE_OPENSSL)
-                    hash = sha256_hex(raw);
+                    dedupe_hash = sha256_hex(raw);
 #endif
                     // Add the messageto the msg map
                     msg_str.emplace(
@@ -485,7 +504,7 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                             move(raw),
                             uid_no,
                             sequence_no,
-                            move(hash)
+                            move(dedupe_hash)
                         )
                     );
                 }
@@ -1011,7 +1030,6 @@ void imap::auth_login_xoauth2(const std::string &username, const std::string &ac
     // base64("user=" user "\x01auth=Bearer " access_token "\x01\x01")
     std::string sasl = "user=" + username + "\x01" + "auth=Bearer " + access_token + "\x01\x01";
     std::string sasl_b64 = b64_encode(sasl);
-debug_bugfix("sasl: " + sasl);
     // IMAP requires a tagged command: AUTHENTICATE XOAUTH2 <base64>
     // (Unlike SMTP which may negotiate with numeric codes.)
     dlg_->send(format("AUTHENTICATE XOAUTH2 " + sasl_b64));
@@ -1196,6 +1214,57 @@ string imap::folder_delimiter()
     }
 }
 
+void imap::noop()
+{
+    // Issue NOOP and process responses until the tagged completion line.
+    dlg_->send(format("NOOP"));
+    bool has_more = true;
+    try
+    {
+        while (has_more)
+        {
+            reset_response_parser();
+            string line = dlg_->receive();
+            tag_result_response_t parsed_line = parse_tag_result(line);
+            if (parsed_line.tag == UNTAGGED_RESPONSE)
+            {
+                // Parse and ignore any untagged updates per RFC 3501 (EXISTS, EXPUNGE, RECENT, FETCH, etc.).
+                parse_response(parsed_line.response);
+                continue;
+            }
+            else if (parsed_line.tag == to_string(tag_))
+            {
+                if (parsed_line.result.has_value() && parsed_line.result.value() == tag_result_response_t::OK)
+                {
+                    has_more = false;
+                    break;
+                }
+                throw imap_error("NOOP failure.", "Response=`" + parsed_line.response + "`.");
+            }
+            else
+            {
+                throw imap_error("Incorrect tag parsed.", "Tag=`" + parsed_line.tag + "`.");
+            }
+        }
+    }
+    catch (const invalid_argument& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+    catch (const out_of_range& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+    reset_response_parser();
+}
+
+void imap::test_simulate_disconnect() { 
+    dlg_->simulate_disconnect(); 
+}
+
+void imap::test_set_simulated_error(dialog::simulated_error_t err, int count) { 
+    dlg_->set_simulated_error(err, count); 
+}
 
 auto imap::parse_tag_result(const string& line) const -> tag_result_response_t
 {

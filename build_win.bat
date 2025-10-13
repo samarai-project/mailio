@@ -10,6 +10,7 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
     -DOPENSSL_USE_STATIC_LIBS=ON ^
     -DMAILIO_BUILD_DOCUMENTATION=OFF ^
     -DMAILIO_BUILD_EXAMPLES=OFF  ^
-    -DMAILIO_BUILD_TESTS=OFF
+    -DMAILIO_BUILD_TESTS=OFF ^
+    -DMAILIO_TEST_HOOKS=ON
     
 cmake --build build --config Release

@@ -35,6 +35,7 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <mailio/q_codec.hpp>
 #include <mailio/mime.hpp>
 #include <mailio/message.hpp>
+#include <mailio/dialog.hpp>
 
 using std::string;
 #if defined(__cpp_char8_t)
@@ -150,7 +151,8 @@ void message::parse(const string& message_str, bool dot_escape)
 {
     mime::parse(message_str, dot_escape);
 
-    if (from_.addresses.size() == 0)
+    // In non-strict mode, do not fail hard if From is missing; archive best-effort.
+    if (strict_mode_ && from_.addresses.size() == 0)
         throw message_error("No author address.", "");
 
     // There is no check if there is a sender in case of multiple authors, not sure if that logic is needed.
@@ -534,12 +536,20 @@ void message::attachment(size_t index, ostream& att_strm, string_t& att_name) co
 
 void message::add_header(const string& name, const string& value)
 {
-    smatch m;
-    if (!regex_match(name, m, mime::HEADER_NAME_REGEX))
-        throw message_error("Header name format error.", "Name is `" + name + "`.");
-    if (!regex_match(value, m, mime::HEADER_VALUE_REGEX))
-        throw message_error("Header value Format error.", "Value is `" + value + "`.");
-    headers_.insert(make_pair(name, value));
+    if (strict_mode_)
+    {
+        smatch m;
+        if (!regex_match(name, m, mime::HEADER_NAME_REGEX))
+            throw message_error("Header name format error.", "Name is `" + name + "`.");
+        if (!regex_match(value, m, mime::HEADER_VALUE_REGEX))
+            throw message_error("Header value Format error.", "Value is `" + value + "`.");
+        headers_.insert(make_pair(name, value));
+    }
+    else
+    {
+        // Be lenient: store as-is for archival.
+        headers_.insert(make_pair(name, value));
+    }
 }
 
 
@@ -554,6 +564,25 @@ const message::headers_t& message::headers() const
     return headers_;
 }
 
+void message::error_state(bool value)
+{
+    error_state_ = value;
+}
+
+bool message::error_state() const
+{
+    return error_state_;
+}
+
+void message::error(const std::string &value)
+{
+    error_ = value;
+}
+
+const std::string &message::error() const
+{
+    return error_;
+}
 
 string message::format_header(bool add_bcc_header) const
 {
@@ -632,52 +661,262 @@ void message::parse_header_line(const string& header_line)
     string header_name, header_value;
     parse_header_name_value(header_line, header_name, header_value);
 
+    // Best-effort fallback address parsing used when strict mode is off and the primary parser fails.
+    auto append_error = [this](const std::string& msg, const std::exception& e)
+    {
+        error_state(true);
+        string use_msg = msg + ": " + e.what();
+		if (const auto* imap_err = dynamic_cast<const dialog_error*>(&e))
+		{
+            use_msg += string("; Details=") + imap_err->details();
+		}
+		if (const auto* mime_err = dynamic_cast<const mailio::mime_error*>(&e))
+		{
+            use_msg += string("; Details=") + mime_err->details();
+		}
+        if (error().empty())
+            error(use_msg);
+        else
+            error(error() + " | " + use_msg);
+    };
+
+    auto best_effort_parse_addresses = [this](const std::string& list) -> mailboxes
+    {
+        // Split by commas outside quotes, parentheses, and angle brackets.
+        std::vector<std::string> tokens;
+        std::string cur;
+        bool in_quotes = false;
+        int paren = 0;
+        int angle = 0;
+        bool escape = false;
+        for (char c : list)
+        {
+            if (escape)
+            {
+                cur.push_back(c);
+                escape = false;
+                continue;
+            }
+            if (c == '\\') { escape = true; cur.push_back(c); continue; }
+            if (c == '"') in_quotes = !in_quotes;
+            else if (!in_quotes)
+            {
+                if (c == '(') paren++;
+                else if (c == ')') paren = std::max(0, paren - 1);
+                else if (c == '<') angle++;
+                else if (c == '>') angle = std::max(0, angle - 1);
+            }
+            if (c == ',' && !in_quotes && paren == 0 && angle == 0)
+            {
+                tokens.push_back(cur);
+                cur.clear();
+            }
+            else
+                cur.push_back(c);
+        }
+        if (!cur.empty()) tokens.push_back(cur);
+
+        std::vector<mail_address> addrs;
+        for (auto& t : tokens)
+        {
+            string token = trim_copy(t);
+            if (token.empty()) continue;
+
+            // Remove comments in parentheses at the end (best-effort)
+            auto close_paren = token.rfind(')');
+            if (close_paren != string::npos)
+            {
+                auto open_paren = token.find('(');
+                if (open_paren != string::npos && open_paren < close_paren)
+                    token.erase(open_paren, close_paren - open_paren + 1);
+                trim(token);
+            }
+
+            mail_address ma;
+            auto lt = token.find('<');
+            auto gt = token.rfind('>');
+            if (lt != string::npos && gt != string::npos && gt > lt)
+            {
+                string name = trim_copy(token.substr(0, lt));
+                if (!name.empty() && name.front() == '"' && name.back() == '"' && name.size() >= 2)
+                    name = name.substr(1, name.size() - 2);
+                try
+                {
+                    ma.name = parse_address_name(name);
+                }
+                catch (...)
+                {
+                    // Be lenient: keep raw name if decoding fails.
+                    ma.name = string_t(name, codec::CHARSET_ASCII);
+                }
+                ma.address = trim_copy(token.substr(lt + 1, gt - lt - 1));
+                if (!ma.address.empty()) addrs.push_back(ma);
+                continue;
+            }
+
+            // Try bare address detection: something@something
+            static const regex SIMPLE_EMAIL{R"(([^\s<>@]+)@([^\s<>@]+))"};
+            smatch m;
+            if (regex_match(token, m, SIMPLE_EMAIL))
+            {
+                ma.address = token;
+                addrs.push_back(ma);
+                continue;
+            }
+
+            // As a last resort, search within the token for an email-like substring.
+            sregex_iterator it(token.begin(), token.end(), SIMPLE_EMAIL);
+            sregex_iterator end;
+            for (; it != end; ++it)
+            {
+                mail_address mm;
+                mm.address = (*it)[0];
+                addrs.push_back(mm);
+            }
+        }
+        return mailboxes(addrs, {});
+    };
+
     if (iequals(header_name, FROM_HEADER))
     {
-        from_ = parse_address_list(header_value);
-        if (from_.addresses.empty())
-            throw message_error("Empty author header.", "");
+        try
+        {
+            from_ = parse_address_list(header_value);
+            if (strict_mode_ && from_.addresses.empty())
+                throw message_error("Empty author header.", "");
+        }
+        catch (const std::exception& e)
+        {
+            if (strict_mode_) throw;
+            from_ = best_effort_parse_addresses(header_value);
+            append_error("From parsing warning", e);
+        }
     }
     else if (iequals(header_name, SENDER_HEADER))
     {
-        mailboxes mbx = parse_address_list(header_value);
-        if (!mbx.addresses.empty())
-            sender_ = mbx.addresses[0];
+        try
+        {
+            mailboxes mbx = parse_address_list(header_value);
+            if (!mbx.addresses.empty())
+                sender_ = mbx.addresses[0];
+        }
+        catch (const std::exception& e)
+        {
+            if (strict_mode_) throw;
+            auto mbx = best_effort_parse_addresses(header_value);
+            if (!mbx.addresses.empty()) sender_ = mbx.addresses[0];
+            append_error("Sender parsing warning", e);
+        }
     }
     else if (iequals(header_name, REPLY_TO_HEADER))
     {
-        mailboxes mbx = parse_address_list(header_value);
-        if (!mbx.addresses.empty())
-            reply_address_ = mbx.addresses[0];
+        try
+        {
+            mailboxes mbx = parse_address_list(header_value);
+            if (!mbx.addresses.empty())
+                reply_address_ = mbx.addresses[0];
+        }
+        catch (const std::exception& e)
+        {
+            if (strict_mode_) throw;
+            auto mbx = best_effort_parse_addresses(header_value);
+            if (!mbx.addresses.empty()) reply_address_ = mbx.addresses[0];
+            append_error("Reply-To parsing warning", e);
+        }
     }
     else if (iequals(header_name, TO_HEADER))
     {
-        recipients_ = parse_address_list(header_value);
+        try
+        {
+            recipients_ = parse_address_list(header_value);
+        }
+        catch (const std::exception& e)
+        {
+            if (strict_mode_) throw;
+            recipients_ = best_effort_parse_addresses(header_value);
+            append_error("To parsing warning", e);
+        }
     }
     else if (iequals(header_name, CC_HEADER))
     {
-        cc_recipients_ = parse_address_list(header_value);
+        try
+        {
+            cc_recipients_ = parse_address_list(header_value);
+        }
+        catch (const std::exception& e)
+        {
+            if (strict_mode_) throw;
+            cc_recipients_ = best_effort_parse_addresses(header_value);
+            append_error("Cc parsing warning", e);
+        }
     }
     else if (iequals(header_name, DISPOSITION_NOTIFICATION_HEADER))
     {
-        mailboxes mbx = parse_address_list(header_value);
-        if (!mbx.addresses.empty())
-            disposition_notification_ = mbx.addresses[0];
+        try
+        {
+            mailboxes mbx = parse_address_list(header_value);
+            if (!mbx.addresses.empty())
+                disposition_notification_ = mbx.addresses[0];
+        }
+        catch (const std::exception& e)
+        {
+            if (strict_mode_) throw;
+            auto mbx = best_effort_parse_addresses(header_value);
+            if (!mbx.addresses.empty()) disposition_notification_ = mbx.addresses[0];
+            append_error("Disposition-Notification-To parsing warning", e);
+        }
     }
     else if (iequals(header_name, MESSAGE_ID_HEADER))
     {
-        auto ids = parse_many_ids(header_value);
-        if (!ids.empty())
-            message_id_ = ids[0];
+        try
+        {
+            auto ids = parse_many_ids(header_value);
+            if (!ids.empty())
+                message_id_ = ids[0];
+        }
+        catch (const std::exception& e)
+        {
+            if (strict_mode_) throw;
+            // Best effort: keep raw header value as message id
+            message_id_ = header_value;
+            append_error("Message-ID parsing warning", e);
+        }
     }
     else if (iequals(header_name, IN_REPLY_TO_HEADER))
-        in_reply_to_ = parse_many_ids(header_value);
+    {
+        try { in_reply_to_ = parse_many_ids(header_value); }
+        catch (const std::exception& e)
+        {
+            if (strict_mode_) throw;
+            // Keep raw value as a single token
+            in_reply_to_.clear();
+            in_reply_to_.push_back(header_value);
+            append_error("In-Reply-To parsing warning", e);
+        }
+    }
     else if (iequals(header_name, REFERENCES_HEADER))
-        references_ = parse_many_ids(header_value);
+    {
+        try { references_ = parse_many_ids(header_value); }
+        catch (const std::exception& e)
+        {
+            if (strict_mode_) throw;
+            references_.clear();
+            references_.push_back(header_value);
+            append_error("References parsing warning", e);
+        }
+    }
     else if (iequals(header_name, SUBJECT_HEADER))
         std::tie(subject_.buffer, subject_.charset, subject_.codec_type) = parse_subject(header_value);
     else if (iequals(header_name, DATE_HEADER))
-        date_time_ = parse_date(trim_copy(header_value));
+    {
+        try { date_time_ = parse_date(trim_copy(header_value)); }
+        catch (const std::exception& e)
+        {
+            if (strict_mode_) throw;
+            // Leave date_time_ as not_a_date_time
+            append_error("Date parsing warning", e);
+        }
+    }
     else if (iequals(header_name, MIME_VERSION_HEADER))
         version_ = trim_copy(header_value);
     else
@@ -1529,7 +1768,11 @@ string_t message::parse_address_name(const string& address_name)
             if (charset.empty())
                 charset = get<1>(an);
             if (charset != get<1>(an))
-                throw message_error("Inconsistent Q encodings.", "Charset `" + charset + "` vs charset `" + get<1>(an) + "`.");
+            {
+                if (strict_mode_)
+                    throw message_error("Inconsistent Q encodings.", "Charset `" + charset + "` vs charset `" + get<1>(an) + "`.");
+                // Be lenient: keep the first charset and continue.
+            }
             if (!buf_codec)
                 buf_codec = get<2>(an);
         }

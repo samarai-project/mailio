@@ -392,7 +392,6 @@ public:
     std::string details() const;
 
 protected:
-
     /**
     Message provided by Asio.
     **/

@@ -970,7 +970,7 @@ public:
 
     @return Detailed error message.
     **/
-    std::string details() const;
+    std::string details() const { return details_; }
 
 protected:
 

@@ -27,6 +27,7 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <tuple>
 #include <variant>
 #include <optional>
+#include <vector>
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/streambuf.hpp>
@@ -453,7 +454,70 @@ public:
     @return            Subfolder tree of the folder.
     @throw *           `folder_delimiter()`, `list_folders(const string&)`.
     **/
-    mailbox_folder_t list_folders(const std::list<std::string>& folder_name);
+    mailbox_folder_t list_folders(const std::list<std::string> &folder_name);
+
+    /**
+    Listing folders with SPECIAL-USE attributes (RFC 6154 / RFC 5258).
+
+    Sends an extended LIST command to retrieve special-use attributes like
+    \All, \Archive, \Drafts, \Junk, \Sent, \Trash (and \Important if supported).
+
+    If only_special is false (default), the command used is:
+        LIST "" "*" RETURN (SPECIAL-USE)
+    which returns all mailboxes along with any SPECIAL-USE attributes they have.
+
+    If only_special is true, the command used is:
+        LIST (SPECIAL-USE) "" "*"
+    which returns only mailboxes that are marked with SPECIAL-USE.
+
+    Returned map keys are mailbox names; values are vectors of special-use
+    attribute strings as advertised by the server (e.g., "\\Sent").
+
+    @param only_special If true, list only special-use mailboxes; otherwise return
+                                            special-use attributes for all mailboxes.
+    @return             Map of mailbox name to a list of its SPECIAL-USE attributes.
+    @throw imap_error   Listing folders failure or parsing failure.
+    */
+    using special_use_map_t = std::map<std::string, std::vector<std::string>>;
+    special_use_map_t list_special_use(bool only_special = false);
+
+    /**
+    Best-effort mapping of SPECIAL-USE attribute to mailbox name.
+
+    Returns a map keyed by canonical special-use names (e.g., "\\Sent", "\\Trash",
+    "\\Drafts", "\\Junk", "\\Archive", "\\All", "\\Important", "\\Flagged")
+    with the value being the mailbox name that advertises that special use.
+
+    If multiple mailboxes claim the same attribute, the first one seen wins. The method
+    never throws on parsing mismatches; it attempts RETURN (SPECIAL-USE), then XLIST, then
+    plain LIST, and extracts what it can.
+
+    @return Map of special-use attribute to mailbox name.
+    */
+    using special_use_by_attr_map_t = std::map<std::string, std::string>;
+    special_use_by_attr_map_t list_special_use_by_attr();
+
+    /**
+    Best-effort listing of folders with an "interest" flag for end users.
+
+    Heuristics:
+    - Always mark INBOX as interesting.
+    - Mark \Sent and \Archive mailboxes as interesting.
+    - Mark utility/system folders as not interesting: \Trash, \Junk (Spam), \Drafts,
+        \All (All Mail), \Important, \Flagged.
+    - Apply a small name-based blacklist for vendor maintenance folders (e.g.,
+        "Sync Issues", "Conflicts", "Local Failures", "Server Failures",
+        "Conversation History", "Clutter", "RSS Feeds", "Suggested Contacts",
+        "Outbox", and non-mail modules like "Calendar", "Contacts", "Tasks",
+        "Notes", "Journal").
+    - Best-effort special-use detection; falls back to names if absent.
+
+    Implementation uses existing listing helpers; it does not duplicate IMAP I/O.
+
+    @return Vector of pairs (mailbox name, is_interesting).
+    */
+    using folders_interest_list_t = std::vector<std::pair<std::string, bool>>;
+    folders_interest_list_t list_folders_interest();
 
     /**
     Deleting a folder.
@@ -537,6 +601,11 @@ public:
     */
     void noop();
 
+    void strict_mode(bool mode);
+    void strict_codec_mode(bool mode);
+    bool strict_mode() const;
+    bool strict_codec_mode() const;    
+    
 #ifdef MAILIO_TEST_HOOKS
 public:
    
@@ -939,6 +1008,10 @@ protected:
     @todo Check if this is breaking protocol, so it has to be added to a strict mode.
     **/
     std::string::size_type eols_no_;
+    
+    bool strict_mode_ = false;
+    bool strict_codec_mode_ = false;
+    
 };
 
 

@@ -200,7 +200,11 @@ void mime::parse(const u8string& mime_string, bool dot_escape)
 mime& mime::parse_by_line(const string& line, bool dot_escape)
 {
     if (line.length() > string::size_type(line_policy_))
-        throw mime_error("Line policy overflow in a header.", "Line is `" + line + "`.");
+    {
+        if (strict_mode_)
+            throw mime_error("Line policy overflow in a header.", "Line is `" + line + "`.");
+        // non-strict: accept long lines for archival
+    }
 
     // mark end of header and parse it
     if (parsing_header_ && line.empty())
@@ -233,6 +237,7 @@ mime& mime::parse_by_line(const string& line, bool dot_escape)
                     mime m;
                     m.line_policy(line_policy_);
                     m.strict_codec_mode(strict_codec_mode_);
+                    m.strict_mode(strict_mode_);
                     parts_.push_back(m);
                 }
                 // mime part sequence ends, so parse the last mime part
@@ -294,7 +299,12 @@ void mime::content_id(string id)
     if (regex_match(id, m, r))
         content_id_ = id;
     else
-        throw mime_error("Invalid content ID.", "Content ID is `" + id + "`.");
+    {
+        if (strict_mode_)
+            throw mime_error("Invalid content ID.", "Content ID is `" + id + "`.");
+        // non-strict: keep raw value for archival
+        content_id_ = id;
+    }
 }
 
 
@@ -786,7 +796,14 @@ void mime::parse_header_name_value(const string& header_line, string& header_nam
 {
     string::size_type colon_pos = header_line.find(HEADER_SEPARATOR_CHAR);
     if (colon_pos == string::npos)
-        throw mime_error("Parsing failure of header line.", "Header line is `" + header_line + "`.");
+    {
+        if (strict_mode_)
+            throw mime_error("Parsing failure of header line.", "Header line is `" + header_line + "`.");
+        // In non-strict mode, treat the whole line as a value-only header and ignore.
+        header_name.clear();
+        header_value = header_line;
+        return;
+    }
 
     header_name = header_line.substr(0, colon_pos);
     trim(header_name);
@@ -794,10 +811,20 @@ void mime::parse_header_name_value(const string& header_line, string& header_nam
     trim(header_value);
 
     if (header_name.empty())
-        throw mime_error("Parsing failure, header name empty.", "Header line parsed is `" + header_line + "`.");
+    {
+        if (strict_mode_)
+            throw mime_error("Parsing failure, header name empty.", "Header line parsed is `" + header_line + "`.");
+        else
+            return;
+    }
     smatch m;
     if (!regex_match(header_name, m, HEADER_NAME_REGEX))
-        throw mime_error("Format failure of the header name.", "Header line parsed is `" + header_line + "`.");
+    {
+        if (strict_mode_)
+            throw mime_error("Format failure of the header name.", "Header line parsed is `" + header_line + "`.");
+        else
+            return;
+    }
 
     if (header_value.empty())
     {
@@ -808,7 +835,11 @@ void mime::parse_header_name_value(const string& header_line, string& header_nam
     }
 
     if (!codec::is_utf8_string(header_value) && !regex_match(header_value, m, HEADER_VALUE_REGEX))
-        throw mime_error("Format failure of the header value", "Header value is `" + header_value + "`.");
+    {
+        if (strict_mode_)
+            throw mime_error("Format failure of the header value", "Header value is `" + header_value + "`.");
+        // else accept invalid value
+    }
 }
 
 
@@ -828,7 +859,10 @@ void mime::parse_content_type(const string& content_type_hdr, media_type_t& medi
         }
         else if (!isalpha(ch) && !isdigit(ch) && CONTENT_ATTR_ALPHABET.find(ch) == string::npos)
         {
-            throw mime_error("Parsing content type value failure.", "Header content type header is `" + content_type_hdr + "`.");
+            if (strict_mode_)
+                throw mime_error("Parsing content type value failure.", "Header content type header is `" + content_type_hdr + "`.");
+            // non-strict: stop parsing further and keep what we have
+            break;
         }
         else if (is_media_type)
         {
@@ -940,8 +974,12 @@ void mime::parse_header_value_attributes(const string& header, string& header_va
                     header_value += *ch;
                 }
                 else
-                    throw mime_error("Parsing header value error.", "Syntax error at character `" + string(1, *ch) + "`, at position " + to_string(char_pos)
-                        + ".\nHeader is `" + header + "`.");
+                {
+                    if (strict_mode_)
+                        throw mime_error("Parsing header value error.", "Syntax error at character `" + string(1, *ch) + "`, at position " + to_string(char_pos)
+                            + ".\nHeader is `" + header + "`.");
+                    // non-strict: ignore unexpected leading chars
+                }
                 break;
 
             case state_t::VALUE:
@@ -950,8 +988,12 @@ void mime::parse_header_value_attributes(const string& header, string& header_va
                 else if (*ch == ATTRIBUTES_SEPARATOR_CHAR)
                     state = state_t::ATTR_BEGIN;
                 else
-                    throw mime_error("Parsing header value error.", "Syntax error at character `" + string(1, *ch) + "`, at position " + to_string(char_pos)
-                        + ".\nHeader is `" + header + "`.");
+                {
+                    if (strict_mode_)
+                        throw mime_error("Parsing header value error.", "Syntax error at character `" + string(1, *ch) + "`, at position " + to_string(char_pos)
+                            + ".\nHeader is `" + header + "`.");
+                    // non-strict: stop here, rest treated as attributes or ignored
+                }
                 break;
 
             case state_t::ATTR_BEGIN:
@@ -965,8 +1007,12 @@ void mime::parse_header_value_attributes(const string& header, string& header_va
                 else if (*ch == NAME_VALUE_SEPARATOR_CHAR)
                     state = state_t::ATTR_SEP;
                 else
-                    throw mime_error("Parsing attribute name error.", "Syntax error at character `" + string(1, *ch) + "`, at position " + to_string(char_pos)
-                        + ".\nHeader is `" + header + "`.");
+                {
+                    if (strict_mode_)
+                        throw mime_error("Parsing attribute name error.", "Syntax error at character `" + string(1, *ch) + "`, at position " + to_string(char_pos)
+                            + ".\nHeader is `" + header + "`.");
+                    // non-strict: ignore malformed character
+                }
                 break;
 
             case state_t::ATTR_NAME:
@@ -996,8 +1042,12 @@ void mime::parse_header_value_attributes(const string& header, string& header_va
                     attribute_value += *ch;
                 }
                 else
-                    throw mime_error("Parsing attribute value error.", "Syntax error at character `" + string(1, *ch) + "`, at position " +
-                        to_string(char_pos) + ".\nHeader is `" + header + "`.");
+                {
+                    if (strict_mode_)
+                        throw mime_error("Parsing attribute value error.", "Syntax error at character `" + string(1, *ch) + "`, at position " +
+                            to_string(char_pos) + ".\nHeader is `" + header + "`.");
+                    // non-strict: ignore
+                }
                 break;
 
             case state_t::POST_EQUAL:
@@ -1011,8 +1061,12 @@ void mime::parse_header_value_attributes(const string& header, string& header_va
                     attribute_value += *ch;
                 }
                 else
-                    throw mime_error("Parsing attribute value error.", "Syntax error at character `" + string(1, *ch) + "` at position " +
-                        to_string(char_pos) + ".\nHeader is `" + header + "`.");
+                {
+                    if (strict_mode_)
+                        throw mime_error("Parsing attribute value error.", "Syntax error at character `" + string(1, *ch) + "` at position " +
+                            to_string(char_pos) + ".\nHeader is `" + header + "`.");
+                    // non-strict: ignore
+                }
                 break;
 
             case state_t::QATTR_VALUE_BEGIN:
@@ -1023,8 +1077,12 @@ void mime::parse_header_value_attributes(const string& header, string& header_va
                 else if (*ch == codec::QUOTE_CHAR)
                     state = state_t::ATTR_VALUE_END;
                 else
-                    throw mime_error("Parsing attribute value error.", "Syntax error at character `" + string(1, *ch) + "` at position " +
-                        to_string(char_pos) + ".\nHeader is `" + header + "`.");
+                {
+                    if (strict_mode_)
+                        throw mime_error("Parsing attribute value error.", "Syntax error at character `" + string(1, *ch) + "` at position " +
+                            to_string(char_pos) + ".\nHeader is `" + header + "`.");
+                    // non-strict: allow unexpected
+                }
                 if (ch == header.end() - 1)
                 {
                     attributes[attribute_name] = attribute_value;
@@ -1046,8 +1104,12 @@ void mime::parse_header_value_attributes(const string& header, string& header_va
                     attribute_value.clear();
                 }
                 else
-                    throw mime_error("Parsing attribute value error.", "Syntax error at character `" + string(1, *ch) + "` at position " + to_string(char_pos)
-                        + ".\nHeader is `" + header + "`.");
+                {
+                    if (strict_mode_)
+                        throw mime_error("Parsing attribute value error.", "Syntax error at character `" + string(1, *ch) + "` at position " + to_string(char_pos)
+                            + ".\nHeader is `" + header + "`.");
+                    // non-strict: ignore char
+                }
                 if (ch == header.end() - 1)
                 {
                     attributes[attribute_name] = attribute_value;
@@ -1065,8 +1127,12 @@ void mime::parse_header_value_attributes(const string& header, string& header_va
                 else if (*ch == ATTRIBUTES_SEPARATOR_CHAR)
                     state = state_t::ATTR_BEGIN;
                 else
-                    throw mime_error("Parsing attribute value error.", "Syntax error at character `" + string(1, *ch) + "` at position " + to_string(char_pos)
-                        + ".\nHeader is `" + header + "`.");
+                {
+                    if (strict_mode_)
+                        throw mime_error("Parsing attribute value error.", "Syntax error at character `" + string(1, *ch) + "` at position " + to_string(char_pos)
+                            + ".\nHeader is `" + header + "`.");
+                    // non-strict: ignore
+                }
                 break;
             }
 
@@ -1165,11 +1231,18 @@ void mime::merge_attributes(attributes_t& attributes) const
             }
             catch (const std::invalid_argument& exc)
             {
-                throw mime_error("Parsing attribute name error.", "Attribute name is `" + attr_name + "`.");
+                if (strict_mode_)
+                    throw mime_error("Parsing attribute name error.", "Attribute name is `" + attr_name + "`.");
+                // non-strict: treat as whole attribute name (no continuation index)
+                attr_name = full_attr_name;
+                attr_part = 1;
             }
             catch (const std::out_of_range& exc)
             {
-                throw mime_error("Parsing attribute error.", "Attribute name is `" + attr_name + "`.");
+                if (strict_mode_)
+                    throw mime_error("Parsing attribute error.", "Attribute name is `" + attr_name + "`.");
+                attr_name = full_attr_name;
+                attr_part = 1;
             }
         }
         attribute_parts[attr_name][attr_part] = attr_value;
@@ -1209,13 +1282,25 @@ string_t mime::decode_value_attribute(const string& attr_value) const
     if (charset_pos != string::npos)
     {
         size_t language_pos = attr_value.find(codec::ATTRIBUTE_CHARSET_SEPARATOR, charset_pos + 1);
+        size_t value_pos = string::npos;
         if (language_pos == string::npos)
-            throw mime_error("Parsing attribute value error.", "No language parameter in the value `" + attr_value + "`.");
-
+        {
+            // Be lenient if not strict: accept missing language separator and
+            // treat the remainder as the value with empty language.
+            if (strict_mode_)
+                throw mime_error("Parsing attribute value error.", "No language parameter in the value `" + attr_value + "`.");
+            value_pos = charset_pos + 1; // language empty, value starts right after first quote
+        }
+        else
+        {
+            value_pos = language_pos + 1;
+        }
         percent pct(static_cast<string::size_type>(line_policy_), static_cast<string::size_type>(line_policy_));
-        return string_t(pct.decode(attr_value.substr(language_pos + 1)), attr_value.substr(0, charset_pos), codec::codec_t::PERCENT);
-    }
-
+        const auto charset = attr_value.substr(0, charset_pos);
+        const auto value = attr_value.substr(value_pos);
+        return string_t(pct.decode(value), charset, codec::codec_t::PERCENT);
+    } 
+    
     // Q decoding
 
     q_codec qc(static_cast<string::size_type>(line_policy_), static_cast<string::size_type>(line_policy_));

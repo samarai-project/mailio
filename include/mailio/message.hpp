@@ -522,6 +522,13 @@ public:
     **/
     const headers_t& headers() const;
 
+    
+    void error_state(bool value);
+    bool error_state() const;
+    
+    void error(const std::string& value);
+    const std::string& error() const;
+    
 protected:
 
     /**
@@ -787,6 +794,9 @@ protected:
     Other headers not included into the known ones.
     **/
     headers_t headers_;
+    
+    bool error_state_{false};
+    std::string error_{};
     
 };
 

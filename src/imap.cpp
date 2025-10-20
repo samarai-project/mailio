@@ -17,6 +17,7 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <functional>
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/compare.hpp>
 #include <boost/algorithm/string/join.hpp>
@@ -49,6 +50,7 @@ using std::vector;
 using std::chrono::milliseconds;
 using boost::system::system_error;
 using boost::iequals;
+using boost::istarts_with;
 using boost::regex;
 using boost::regex_match;
 using boost::smatch;
@@ -391,7 +393,8 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
     string cmd;
     if (is_uids)
         cmd.append("UID ");
-    cmd.append("FETCH " + message_ids + TOKEN_SEPARATOR_STR + RFC822_TOKEN);
+    // cmd.append("FETCH " + message_ids + TOKEN_SEPARATOR_STR + RFC822_TOKEN);
+    cmd.append("FETCH " + message_ids + TOKEN_SEPARATOR_STR + "(" + string("UID ") + RFC822_TOKEN + ")");
     dlg_->send(format(cmd));
 
     // stores [msg_str, uid_no, sequence_no, hash] indexed by sequence_no or uid_no
@@ -515,14 +518,49 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                 if (parsed_line.result.value() == tag_result_response_t::OK)
                 {
                     has_more = false;
-                    for (const auto& ms : msg_str)
+                    for (const auto &ms : msg_str)
                     {
                         message msg;
-                        msg.line_policy(line_policy);
-                        msg.parse(std::get<0>(ms.second));
-                        msg.uid(std::get<1>(ms.second));
-                        msg.sequence_no(std::get<2>(ms.second));
-                        msg.dedupe_hash(std::get<3>(ms.second));
+                        try
+                        {
+                            msg.strict_mode(strict_mode_);
+                            msg.strict_codec_mode(strict_codec_mode_);
+                            msg.uid(std::get<1>(ms.second));
+                            msg.sequence_no(std::get<2>(ms.second));
+                            msg.dedupe_hash(std::get<3>(ms.second));
+                            msg.line_policy(line_policy);
+                            msg.parse(std::get<0>(ms.second));
+                        }
+                        catch (const dialog_error &ex)
+                        {
+                            if (!strict_mode_)
+                            {
+                                msg.error_state(true);
+                                msg.error(std::string("Error pasing message: ") + ex.what() + "\nDetails: " + ex.details());
+                            }
+                            else
+                                throw;
+                        }
+                        catch (const mime_error &ex)
+                        {
+                            if (!strict_mode_)
+                            {
+                                msg.error_state(true);
+                                msg.error(std::string("Error pasing message: ") + ex.what() + "\nDetails: " + ex.details());
+                            }
+                            else
+                                throw;                            
+                        }
+                        catch (const std::exception &ex)
+                        {
+                            if (!strict_mode_)
+                            {
+                                msg.error_state(true);
+                                msg.error(std::string("Error pasing message: ") + ex.what());
+                            }
+                            else
+                                throw;
+                        }
                         found_messages.emplace(ms.first, move(msg));
                     }
                 }
@@ -921,6 +959,270 @@ auto imap::list_folders(const list<string>& folder_name) -> mailbox_folder_t
     return list_folders(folder_name_s);
 }
 
+auto imap::list_special_use(bool only_special) -> special_use_map_t
+{
+    // Ensure delimiter is known so that later callers can split names if they wish.
+    (void)folder_delimiter();
+
+    special_use_map_t result;
+
+    auto parse_and_collect = [&](const string& command, const vector<string>& accept_atoms) -> bool
+    {
+        // Returns true if the command completed with tagged OK. Returns false on tagged NO/BAD.
+        // Never throws; best effort parsing.
+        try
+        {
+            dlg_->send(format(command));
+        }
+        catch (...)
+        {
+            return false;
+        }
+
+        bool has_more = true;
+        while (has_more)
+        {
+            string line;
+            try
+            {
+                line = dlg_->receive();
+                auto parsed_line = parse_tag_result(line);
+
+                if (parsed_line.tag == UNTAGGED_RESPONSE)
+                {
+                    try
+                    {
+                        reset_response_parser();
+                        parse_response(parsed_line.response);
+                        if (mandatory_part_.empty() || mandatory_part_.front()->token_type != response_token_t::token_type_t::ATOM)
+                            continue;
+
+                        auto head = mandatory_part_.front();
+                        mandatory_part_.pop_front();
+                        bool atom_ok = false;
+                        for (const auto& a : accept_atoms)
+                            if (iequals(head->atom, a)) { atom_ok = true; break; }
+                        if (!atom_ok)
+                            continue;
+
+                        // Locate attribute list (first LIST token), delimiter (ignored), and mailbox name (last ATOM/LITERAL)
+                        shared_ptr<response_token_t> attr_list_tok;
+                        for (auto& tok : mandatory_part_)
+                            if (tok->token_type == response_token_t::token_type_t::LIST) { attr_list_tok = tok; break; }
+
+                        // Find name token scanning from the end
+                        string mailbox_name;
+                        for (auto it = mandatory_part_.rbegin(); it != mandatory_part_.rend(); ++it)
+                        {
+                            if ((*it)->token_type == response_token_t::token_type_t::ATOM)
+                            {
+                                mailbox_name = (*it)->atom;
+                                break;
+                            }
+                            else if ((*it)->token_type == response_token_t::token_type_t::LITERAL)
+                            {
+                                mailbox_name = (*it)->literal;
+                                break;
+                            }
+                        }
+                        if (mailbox_name.empty())
+                            continue;
+
+                        vector<string> special_attrs;
+                        if (attr_list_tok)
+                        {
+                            for (const auto& a : attr_list_tok->parenthesized_list)
+                            {
+                                if (a->token_type == response_token_t::token_type_t::ATOM)
+                                {
+                                    const string& attr = a->atom;
+                                    if (!attr.empty() && attr[0] == '\\')
+                                    {
+                                        if (iequals(attr, "\\All") || iequals(attr, "\\Archive") || iequals(attr, "\\Drafts") ||
+                                            iequals(attr, "\\Flagged") || iequals(attr, "\\Junk") || iequals(attr, "\\Sent") ||
+                                            iequals(attr, "\\Trash") || iequals(attr, "\\Important"))
+                                        {
+                                            special_attrs.push_back(attr);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!special_attrs.empty() || !only_special)
+                            result[mailbox_name] = move(special_attrs);
+                    }
+                    catch (...)
+                    {
+                        // Best effort: ignore parsing problems on this line.
+                        reset_response_parser();
+                        continue;
+                    }
+                }
+                else if (parsed_line.tag == to_string(tag_))
+                {
+                    // Completion of the command. If not OK, signal refusal.
+                    bool ok = parsed_line.result.has_value() && parsed_line.result.value() == tag_result_response_t::OK;
+                    reset_response_parser();
+                    return ok;
+                }
+                // Ignore other tags
+            }
+            catch (...)
+            {
+                // Can't parse this line or receive failed; skip and try next
+                continue;
+            }
+        }
+        return true;
+    };
+
+    // Try preferred: LIST RETURN (SPECIAL-USE)
+    bool ok = parse_and_collect("LIST \"\" \"*\" RETURN (SPECIAL-USE)", {"LIST"});
+    if (!ok || (only_special && result.empty()))
+    {
+        // Fallback to XLIST
+        (void)parse_and_collect("XLIST \"\" \"*\"", {"XLIST", "LIST"});
+        if (result.empty())
+        {
+            // Last resort: plain LIST
+            (void)parse_and_collect("LIST \"\" \"*\"", {"LIST"});
+        }
+    }
+
+    return result;
+}
+
+auto imap::list_special_use_by_attr() -> special_use_by_attr_map_t
+{
+    // Use the best-effort collector and invert into attr->mailbox map.
+    // We want only special-use mailboxes, so filter client-side.
+    auto per_mailbox = list_special_use(true);
+
+    auto normalize = [](const string& attr) -> string
+    {
+        // Canonicalize a few common synonyms from XLIST into SPECIAL-USE names.
+        if (iequals(attr, "\\AllMail") || iequals(attr, "\\All")) return "\\All";
+        if (iequals(attr, "\\Junk") || iequals(attr, "\\Spam")) return "\\Junk";
+        if (iequals(attr, "\\Sent")) return "\\Sent";
+        if (iequals(attr, "\\Trash")) return "\\Trash";
+        if (iequals(attr, "\\Drafts")) return "\\Drafts";
+        if (iequals(attr, "\\Flagged")) return "\\Flagged";
+        if (iequals(attr, "\\Archive")) return "\\Archive";
+        if (iequals(attr, "\\Important")) return "\\Important";
+        return attr; // pass-through unknowns
+    };
+
+    special_use_by_attr_map_t out;
+    for (const auto& kv : per_mailbox)
+    {
+        const auto& mailbox = kv.first;
+        const auto& attrs = kv.second;
+        for (const auto& a : attrs)
+        {
+            string canon = normalize(a);
+            if (!canon.empty() && out.find(canon) == out.end())
+                out.emplace(canon, mailbox);
+        }
+    }
+    return out;
+}
+
+auto imap::list_folders_interest() -> folders_interest_list_t
+{
+    folders_interest_list_t out;
+
+    // 1) Collect special-use mapping (best effort)
+    auto special = list_special_use_by_attr();
+
+    // Helper to test if a name matches a blacklist token (case-insensitive, substring match)
+    auto icontains = [](const string& hay, const string& needle) -> bool
+    {
+        if (needle.empty()) return false;
+        auto h = hay; auto n = needle;
+        boost::algorithm::to_lower(h);
+        boost::algorithm::to_lower(n);
+        return h.find(n) != string::npos;
+    };
+
+    // 2) List all folders from root using existing helper
+    mailbox_folder_t tree = list_folders("");
+
+    // Flatten the tree to full paths
+    string delim = folder_delimiter();
+    vector<string> all_folders;
+    std::function<void(const mailbox_folder_t&, const string&)> walk = [&](const mailbox_folder_t& node, const string& prefix)
+    {
+        for (const auto& kv : node.folders)
+        {
+            string name = prefix.empty() ? kv.first : (prefix + delim + kv.first);
+            all_folders.push_back(name);
+            walk(kv.second, name);
+        }
+    };
+    walk(tree, "");
+
+    // 3) Build inverse map mailbox->special-uses from special (attr->mailbox)
+    map<string, vector<string>> mailbox_attrs;
+    for (const auto& kv : special)
+        mailbox_attrs[kv.second].push_back(kv.first);
+
+    // 4) Heuristics per folder
+    for (const auto& mbox : all_folders)
+    {
+        bool interesting = false;
+
+        // Always interesting: INBOX (case-insensitive exact)
+        if (iequals(mbox, "INBOX"))
+        {
+            interesting = true;
+        }
+        else
+        {
+            // If it has SPECIAL-USE
+            auto it = mailbox_attrs.find(mbox);
+            if (it != mailbox_attrs.end())
+            {
+                // Positive: \Sent, \Archive
+                for (const auto& a : it->second)
+                    if (iequals(a, "\\Sent") || iequals(a, "\\Archive"))
+                        interesting = true;
+
+                // Negative overrides: \Trash, \Junk, \Drafts, \All, \Important, \Flagged
+                for (const auto& a : it->second)
+                    if (iequals(a, "\\Trash") || iequals(a, "\\Junk") || iequals(a, "\\Drafts") ||
+                        iequals(a, "\\All") || iequals(a, "\\Important") || iequals(a, "\\Flagged"))
+                        interesting = false;
+            }
+
+            // If no explicit special-use flags or still undecided, use small name blacklist
+            if (!interesting)
+            {
+                static const char* blacklist[] = {
+                    "Sync Issues", "Conflicts", "Local Failures", "Server Failures",
+                    "Conversation History", "Clutter", "RSS Feeds", "RSS Subscriptions",
+                    "Suggested Contacts", "Outbox", "Calendar", "Contacts", "Tasks",
+                    "Notes", "Journal", "All Mail", "Important", "Starred", "Spam",
+                    "Trash", "Junk", "Drafts"
+                };
+                bool black = false;
+                for (auto term : blacklist)
+                    if (icontains(mbox, term)) { black = true; break; }
+                if (!black)
+                {
+                    // Default: most user-created folders are interesting, but avoid marking vendor roots like [Gmail]
+                    if (!icontains(mbox, "[Gmail]"))
+                        interesting = true;
+                }
+            }
+        }
+
+        out.emplace_back(mbox, interesting);
+    }
+
+    return out;
+}
+
 
 bool imap::delete_folder(const string& folder_name)
 {
@@ -1257,6 +1559,11 @@ void imap::noop()
     }
     reset_response_parser();
 }
+
+void imap::strict_mode(bool mode) { strict_mode_ = mode; }
+void imap::strict_codec_mode(bool mode) { strict_codec_mode_ = mode; }
+bool imap::strict_mode() const { return strict_mode_; }
+bool imap::strict_codec_mode() const { return strict_codec_mode_; }
 
 void imap::test_simulate_disconnect() { 
     dlg_->simulate_disconnect(); 

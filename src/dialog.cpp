@@ -130,6 +130,25 @@ string dialog::receive(bool raw)
 }
 
 
+string dialog::receive_bytes(std::size_t total_bytes, std::size_t chunk_size)
+{
+#ifdef MAILIO_TEST_HOOKS
+    if (sim_error_count_ > 0 && (sim_error_ == simulated_error_t::RECV_FAIL || sim_error_ == simulated_error_t::TIMEOUT_RECV))
+    {
+        --sim_error_count_;
+        if (sim_error_ == simulated_error_t::RECV_FAIL)
+            throw dialog_error("Network receiving error.", "Simulated failure");
+        if (sim_error_ == simulated_error_t::TIMEOUT_RECV)
+            throw dialog_error("Network receiving timed out.", "Simulated timeout");
+    }
+#endif
+    if (timeout_.count() == 0)
+        return receive_exact_sync(*socket_, total_bytes);
+    else
+        return receive_exact_async(*socket_, total_bytes, chunk_size);
+}
+
+
 template<typename Socket>
 void dialog::send_sync(Socket& socket, const string& line)
 {
@@ -168,19 +187,17 @@ void dialog::connect_async()
 {
     tcp::resolver res(ios_);
     check_timeout();
-
-    bool has_connected{false}, connect_error{false};
-    error_code errc;
+    struct op_state { bool done{false}; bool error{false}; error_code ec; };
+    auto st = std::make_shared<op_state>();
+    auto self = shared_from_this();
     async_connect(*socket_, res.resolve(hostname_, to_string(port_)),
-        [&has_connected, &connect_error, &errc](const error_code& error, const boost::asio::ip::tcp::endpoint&)
+        [st, self](const error_code& error, const boost::asio::ip::tcp::endpoint&)
         {
-            if (!error)
-                has_connected = true;
-            else
-                connect_error = true;
-            errc = error;
+            st->done  = !error;
+            st->error = !!error;
+            st->ec    = error;
         });
-    wait_async(has_connected, connect_error, "Network connecting timed out.", "Network connecting failed.", errc);
+    wait_async(st->done, st->error, "Network connecting timed out.", "Network connecting failed.", st->ec);
 }
 
 
@@ -188,19 +205,20 @@ template<typename Socket>
 void dialog::send_async(Socket& socket, string line)
 {
     check_timeout();
-    string l = line + "\r\n";
-    bool has_written{false}, send_error{false};
-    error_code errc;
-    async_write(socket, buffer(l, l.size()),
-        [&has_written, &send_error, &errc](const error_code& error, size_t)
+    // Keep the write buffer alive for the lifetime of the async operation.
+    auto buf = std::make_shared<string>(move(line));
+    buf->append("\r\n");
+    struct op_state { bool done{false}; bool error{false}; error_code ec; };
+    auto st = std::make_shared<op_state>();
+    auto self = this->shared_from_this();
+    async_write(socket, buffer(*buf),
+        [st, buf, self](const error_code& error, size_t)
         {
-            if (!error)
-                has_written = true;
-            else
-                send_error = true;
-            errc = error;
+            st->done  = !error;
+            st->error = !!error;
+            st->ec    = error;
         });
-    wait_async(has_written, send_error, "Network sending timed out.", "Network sending failed.", errc);
+    wait_async(st->done, st->error, "Network sending timed out.", "Network sending failed.", st->ec);
 }
 
 
@@ -208,25 +226,107 @@ template<typename Socket>
 string dialog::receive_async(Socket& socket, bool raw)
 {
     check_timeout();
-    bool has_read{false}, receive_error{false};
-    string line;
-    error_code errc;
+    struct op_state { bool done{false}; bool error{false}; error_code ec; };
+    auto st = std::make_shared<op_state>();
+    auto self = this->shared_from_this();
     async_read_until(socket, *strmbuf_, "\n",
-        [&has_read, &receive_error, this, &line, &errc, raw](const error_code& error, size_t)
+        [st, self](const error_code& error, size_t)
         {
             if (!error)
-            {
-                getline(*istrm_, line, '\n');
-                if (!raw)
-                    trim_if(line, is_any_of("\r\n"));
-                has_read = true;
-            }
+                st->done = true;
             else
-                receive_error = true;
-            errc = error;
+                st->error = true;
+            st->ec = error;
         });
-    wait_async(has_read, receive_error, "Network receiving timed out.", "Network receiving failed.", errc);
+    wait_async(st->done, st->error, "Network receiving timed out.", "Network receiving failed.", st->ec);
+    string line;
+    getline(*istrm_, line, '\n');
+    if (!raw)
+        trim_if(line, is_any_of("\r\n"));
     return line;
+}
+
+
+template<typename Socket>
+string dialog::receive_exact_sync(Socket& socket, std::size_t total_bytes)
+{
+    try
+    {
+        if (total_bytes == 0)
+            return std::string();
+        std::string out;
+        out.resize(total_bytes);
+        std::size_t copied = 0;
+
+        // 1) Drain any bytes already buffered by previous read_until into streambuf_.
+        while (copied < total_bytes && strmbuf_ && strmbuf_->size() > 0)
+        {
+            std::size_t avail = strmbuf_->size();
+            std::size_t to_copy = std::min(total_bytes - copied, avail);
+            istrm_->read(&out[copied], static_cast<std::streamsize>(to_copy));
+            copied += to_copy;
+        }
+
+        // 2) Read the remainder directly from the socket.
+        while (copied < total_bytes)
+        {
+            auto n = socket.read_some(buffer(&out[copied], total_bytes - copied));
+            if (n == 0)
+                throw dialog_error("Network receiving error.", "Unexpected EOF");
+            copied += n;
+        }
+        return out;
+    }
+    catch (const system_error& exc)
+    {
+        throw dialog_error("Network receiving error.", exc.code().message());
+    }
+}
+
+
+template<typename Socket>
+string dialog::receive_exact_async(Socket& socket, std::size_t total_bytes, std::size_t chunk_size)
+{
+    if (chunk_size == 0)
+        chunk_size = 32 * 1024;
+    if (total_bytes == 0)
+        return std::string();
+    auto out = std::make_shared<std::string>();
+    out->resize(total_bytes);
+    std::size_t copied = 0;
+
+    // 1) Drain any bytes already buffered by previous read_until into streambuf_.
+    while (copied < total_bytes && strmbuf_ && strmbuf_->size() > 0)
+    {
+        std::size_t avail = strmbuf_->size();
+        std::size_t to_copy = std::min(total_bytes - copied, avail);
+        istrm_->read(&(*out)[copied], static_cast<std::streamsize>(to_copy));
+        copied += to_copy;
+    }
+
+    // 2) Read the remainder from the socket in timed chunks.
+    while (copied < total_bytes)
+    {
+        check_timeout();
+        struct op_state { bool done{false}; bool error{false}; error_code ec; };
+        auto st = std::make_shared<op_state>();
+        std::size_t to_read = std::min(chunk_size, total_bytes - copied);
+        auto buf = buffer(&(*out)[copied], to_read);
+        auto self = this->shared_from_this();
+        async_read(socket, buf, boost::asio::transfer_exactly(to_read),
+            [st, out, self](const error_code& error, size_t /*bytes*/)
+            {
+                if (!error)
+                    st->done = true;
+                else
+                    st->error = true;
+                st->ec = error;
+            });
+        wait_async(st->done, st->error, "Network receiving timed out.", "Network receiving failed.", st->ec);
+        // If we reached here, we consumed 'to_read' bytes successfully.
+        copied += to_read;
+    }
+    return *out;
 }
 
 
@@ -241,6 +341,9 @@ void dialog::wait_async(const bool& has_op, const bool& op_error, const char* ex
         ios_.run_one();
     }
     while (!has_op);
+    // Cancel any pending timer to avoid stray callbacks after the operation completed.
+    if (timer_)
+        timer_->cancel();
 }
 
 
@@ -310,6 +413,25 @@ string dialog_ssl::receive(bool raw)
             return receive_sync(*ssl_socket_, raw);
         else
             return receive_async(*ssl_socket_, raw);
+    }
+    catch (const system_error& exc)
+    {
+        throw dialog_error("Network receiving error.", exc.code().message());
+    }
+}
+
+
+string dialog_ssl::receive_bytes(std::size_t total_bytes, std::size_t chunk_size)
+{
+    if (!ssl_)
+        return dialog::receive_bytes(total_bytes, chunk_size);
+
+    try
+    {
+        if (timeout_.count() == 0)
+            return receive_exact_sync(*ssl_socket_, total_bytes);
+        else
+            return receive_exact_async(*ssl_socket_, total_bytes, chunk_size);
     }
     catch (const system_error& exc)
     {

@@ -457,23 +457,29 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
 
                 if (literal_token != nullptr)
                 {
-                    // Read the literal payload possibly followed by additional list items (e.g., UID after RFC822 literal).
-                    // Loop to read string literal.
-                    while (literal_state_ == string_literal_state_t::READING)
+                    // Read the literal payload exactly. The CRLF after the size marker was already consumed by the
+                    // line-based receive that delivered the '{N}' line to the parser.
+                    try
                     {
-                        string line = dlg_->receive(true);
-                        if (!line.empty())
-                            trim_eol(line);
-                        parse_response(line);
+                        const auto literal_size = stoul(literal_token->literal_size);
+                        literal_token->literal = dlg_->receive_bytes(literal_size);
+                        // Mark literal parsing done for the internal state machine.
+                        literal_bytes_read_ = literal_size;
+                        literal_state_ = string_literal_state_t::DONE;
                     }
-                    // Closing parenthesis not yet read.
-                    if (literal_state_ == string_literal_state_t::DONE && parenthesis_list_counter_ > 0)
+                    catch (const dialog_error&)
                     {
-                        string line = dlg_->receive(true);
-                        if (!line.empty())
-                            trim_eol(line);
-                        // There could be a parenthesized list after the string literal. Read it and do nothing.
-                        parse_response(line);
+                        throw; // rethrow as dialog_error -> imap_error caught later
+                    }
+
+                    // After the literal payload, the server continues the same response line (e.g., ")" or " UID <n>)").
+                    // Read the remainder of that line and parse it to close lists and capture any trailing atoms.
+                    if (parenthesis_list_counter_ > 0 || literal_state_ == string_literal_state_t::DONE)
+                    {
+                        string tail = dlg_->receive(true);
+                        if (!tail.empty())
+                            trim_eol(tail);
+                        parse_response(tail);
                     }
                     // After reading the literal, rescan the FETCH data list for UID if it was placed after the literal.
                     if (uid_no == 0 && fetch_list_token != nullptr)
@@ -500,6 +506,43 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
 #if defined(MAILIO_HAVE_OPENSSL)
                     dedupe_hash = sha256_hex(raw);
 #endif
+                    // Normalize end-of-lines to CRLF for parsing. After switching to chunk-based timeouts,
+                    // some servers/messages may present bare LF or lone CR. The MIME/codec stack expects
+                    // consistent CRLFs and will split into lines without embedded CR/LF before 7bit decode.
+                    if (!raw.empty())
+                    {
+                        string normalized;
+                        normalized.reserve(raw.size() + raw.size() / 32);
+                        for (size_t i = 0; i < raw.size(); ++i)
+                        {
+                            char c = raw[i];
+                            if (c == '\r')
+                            {
+                                if (i + 1 < raw.size() && raw[i + 1] == '\n')
+                                {
+                                    // Already CRLF, copy once and skip the LF.
+                                    normalized += "\r\n";
+                                    ++i;
+                                }
+                                else
+                                {
+                                    // Lone CR -> CRLF
+                                    normalized += "\r\n";
+                                }
+                            }
+                            else if (c == '\n')
+                            {
+                                // Bare LF -> CRLF
+                                normalized += "\r\n";
+                            }
+                            else
+                            {
+                                normalized += c;
+                            }
+                        }
+                        raw.swap(normalized);
+                    }
+                    
                     // Add the messageto the msg map
                     msg_str.emplace(
                         is_uids ? uid_no : sequence_no,
@@ -510,6 +553,7 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                             move(dedupe_hash)
                         )
                     );
+                    
                 }
             }
             // The tagged response determines status and parses provided messages in `msg_str`.

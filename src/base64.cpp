@@ -131,7 +131,7 @@ string base64::decode(const vector<string>& text) const
         for (string::size_type ch = 0; ch < line.length() && line[ch] != EQUAL_CHAR; ch++)
         {
             if (!is_allowed(line[ch]))
-                throw codec_error("Bad character `" + string(1, line[ch]) + "`.");
+                throw codec_error("Bad character (Base64) `" + string(1, line[ch]) + "`.");
 
             sextets[count_4_chars++] = line[ch];
             if (count_4_chars == SEXTETS_NO)

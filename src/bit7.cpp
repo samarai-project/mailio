@@ -77,7 +77,7 @@ vector<string> bit7::encode(const string& text) const
             ch++;
         }
         else
-            throw codec_error("Bad character `" + string(1, *ch) + "`.");
+            throw codec_error("Bad character (bit7 encode) `" + string(1, *ch) + "`.");
 
         if (line_len == policy)
             add_new_line(is_folding, line);
@@ -103,7 +103,7 @@ string bit7::decode(const vector<string>& text) const
         for (auto ch : line)
         {
             if (!is_allowed(ch))
-                throw codec_error("Bad character `" + string(1, ch) + "`.");
+                throw codec_error("Bad character (bit7 decode) `" + string(1, ch) + "`.");
 
             dec_text += ch;
         }

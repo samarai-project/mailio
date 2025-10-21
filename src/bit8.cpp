@@ -60,7 +60,7 @@ vector<string> bit8::encode(const string& text) const
             ch++;
         }
         else
-            throw codec_error("Bad character `" + string(1, *ch) + "`.");
+            throw codec_error("Bad character (bit8 encode) `" + string(1, *ch) + "`.");
 
         if (is_first_line)
         {
@@ -96,7 +96,7 @@ string bit8::decode(const vector<string>& text) const
         for (auto ch : line)
         {
             if (!is_allowed(ch))
-                throw codec_error("Bad character `" + string(1, ch) + "`.");
+                throw codec_error("Bad character (bit8 decode) `" + string(1, ch) + "`.");
 
             dec_text += ch;
         }

@@ -89,6 +89,21 @@ public:
     **/
     virtual std::string receive(bool raw = false);
 
+    /**
+    Receiving an exact number of bytes from network.
+
+    This reads exactly total_bytes octets from the socket. If a timeout is configured,
+    it is applied per data chunk so that long transfers can make forward progress as long
+    as data continues to arrive.
+
+    @param total_bytes  Total number of bytes to read.
+    @param chunk_size   Minimum chunk size for each timed read operation when timeout is non-zero.
+                        Defaults to 32 KiB. The last chunk may be smaller.
+    @return             Bytes read from network, exactly total_bytes long.
+    @throw *            `receive_exact_sync<Socket>(Socket&, std::size_t)`, `receive_exact_async<Socket>(Socket&, std::size_t, std::size_t)`.
+    **/
+    virtual std::string receive_bytes(std::size_t total_bytes, std::size_t chunk_size = 32 * 1024);
+
 #ifdef MAILIO_TEST_HOOKS
 
     /**
@@ -164,6 +179,32 @@ protected:
     **/
     template<typename Socket>
     std::string receive_async(Socket& socket, bool raw);
+
+    /**
+    Receiving an exact number of bytes in synchronous manner.
+
+    @param socket       Socket to use for I/O.
+    @param total_bytes  Number of bytes to read.
+    @return             Bytes read.
+    @throw dialog_error Network receiving error.
+    **/
+    template<typename Socket>
+    std::string receive_exact_sync(Socket& socket, std::size_t total_bytes);
+
+    /**
+    Receiving an exact number of bytes within the given timeout period, performed in chunks.
+
+    For non-zero timeouts, this method reads in chunks and restarts the timer per chunk so
+    that timeouts are relative to recent activity, not the full transfer length.
+
+    @param socket       Socket to use for I/O.
+    @param total_bytes  Number of bytes to read.
+    @param chunk_size   Chunk size for each timed read.
+    @return             Bytes read.
+    @throw dialog_error Network receiving failed or timed out.
+    **/
+    template<typename Socket>
+    std::string receive_exact_async(Socket& socket, std::size_t total_bytes, std::size_t chunk_size);
 
 
     /**
@@ -318,6 +359,16 @@ public:
     @throw *   `dialog::receive()`, `receive_sync<Socket>(Socket&, bool)`, `receive_async<Socket>(Socket&, bool)`.
     **/
     std::string receive(bool raw = false);
+
+    /**
+    Receiving an exact number of bytes over SSL or plain depending on SSL state.
+
+    @param total_bytes  Number of bytes to read.
+    @param chunk_size   Chunk size for timed reads (when timeout is non-zero).
+    @return             Bytes read.
+    @throw *            `dialog::receive_bytes`, `receive_exact_sync<Socket>(Socket&, std::size_t)`, `receive_exact_async<Socket>(Socket&, std::size_t, std::size_t)`.
+    **/
+    std::string receive_bytes(std::size_t total_bytes, std::size_t chunk_size = 32 * 1024);
 
     /**
     Replacing a TCP socket with an SSL one.

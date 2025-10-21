@@ -80,9 +80,9 @@ string percent::decode(const string& txt) const
         if (*ch == codec::PERCENT_HEX_FLAG)
         {
             if (ch + 1 == txt.end() || ch + 2 == txt.end())
-                throw codec_error("Bad character.");
+                throw codec_error("Bad character (percent decode).");
             if (std::isxdigit(*(ch + 1)) == 0 || std::isxdigit(*(ch + 2)) == 0)
-                throw codec_error("Bad character.");
+                throw codec_error("Bad character (percent decode isxdigit).");
 
             char next_char = toupper(*(ch + 1));
             char next_next_char = toupper(*(ch + 2));

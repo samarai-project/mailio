@@ -160,10 +160,10 @@ vector<string> quoted_printable::encode(const string& text) const
         else if (*ch == CR_CHAR)
         {
             if (q_codec_mode_)
-                throw codec_error("Bad character `" + string(1, *ch) + "`.");
+                throw codec_error("Bad character (quoted encode) `" + string(1, *ch) + "`.");
 
             if (ch + 1 == text.end() || (ch + 1 != text.end() && *(ch + 1) != LF_CHAR))
-                throw codec_error("Bad CRLF sequence.");
+                throw codec_error("Bad CRLF sequence (quoted encode).");
             add_new_line(line);
             // Two characters have to be skipped.
             ch++;
@@ -220,7 +220,7 @@ string quoted_printable::decode(const vector<string>& text) const
         for (string::const_iterator ch = line.begin(); ch != line.end(); ch++)
         {
             if (!is_allowed(*ch))
-                throw codec_error("Bad character `" + string(1, *ch) + "`.");
+                throw codec_error("Bad character (quoted decode) `" + string(1, *ch) + "`.");
 
             if (*ch == EQUAL_CHAR)
             {
@@ -234,7 +234,7 @@ string quoted_printable::decode(const vector<string>& text) const
                 char next_char = toupper(*(ch + 1));
                 char next_next_char = toupper(*(ch + 2));
                 if (!is_allowed(next_char) || !is_allowed(next_next_char))
-                    throw codec_error("Bad character.");
+                    throw codec_error("Bad character (quoted decode upper).");
 
                 if (HEX_DIGITS.find(next_char) == string::npos || HEX_DIGITS.find(next_next_char) == string::npos)
                     throw codec_error("Bad hexadecimal digit.");

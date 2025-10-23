@@ -94,6 +94,7 @@ const string message::SUBJECT_HEADER{"Subject"};
 const string message::DATE_HEADER{"Date"};
 const string message::DISPOSITION_NOTIFICATION_HEADER{"Disposition-Notification-To"};
 const string message::MIME_VERSION_HEADER{"MIME-Version"};
+const string message::AUTHENTICATION_RESULTS_HEADER{"Authentication-Results"};
 
 
 message::message() : mime(), date_time_(second_clock::universal_time(), time_zone_ptr(new posix_time_zone("00:00")))
@@ -678,6 +679,8 @@ void message::parse_header_line(const string& header_line)
             error(use_msg);
         else
             error(error() + " | " + use_msg);
+        // Mark message as suspicious on parsing anomalies in non-strict mode
+        if (!strict_mode_) suspicious_ = true;
     };
 
     auto best_effort_parse_addresses = [this](const std::string& list) -> mailboxes
@@ -919,6 +922,18 @@ void message::parse_header_line(const string& header_line)
     }
     else if (iequals(header_name, MIME_VERSION_HEADER))
         version_ = trim_copy(header_value);
+    else if (iequals(header_name, AUTHENTICATION_RESULTS_HEADER))
+    {
+        // Preserve raw header
+        headers_.insert(make_pair(header_name, header_value));
+        // Parse best-effort and set message-level flags
+        try { parse_authentication_results(header_value); }
+        catch (const std::exception& e)
+        {
+            if (strict_mode_) throw;
+            append_error("Authentication-Results parsing warning", e);
+        }
+    }
     else
     {
         if (!iequals(header_name, CONTENT_TYPE_HEADER) && !iequals(header_name, CONTENT_TRANSFER_ENCODING_HEADER) &&
@@ -927,6 +942,86 @@ void message::parse_header_line(const string& header_line)
             headers_.insert(make_pair(header_name, header_value));
         }
     }
+}
+
+// Parse Authentication-Results per RFC 7601 (best-effort)
+// Captures mechanism results for spf, dkim, and dmarc and associated domains if present.
+void message::parse_authentication_results(const string& header_value)
+{
+    using result_t = authentication_results_t::result_t;
+
+    auto to_result = [](string v) -> result_t
+    {
+        v = boost::to_lower_copy(v);
+        if (v == "pass") return result_t::PASS;
+        if (v == "fail") return result_t::FAIL;
+        if (v == "softfail") return result_t::SOFTFAIL;
+        if (v == "neutral") return result_t::NEUTRAL;
+        if (v == "temperror" || v == "temp_error" || v == "temp-error") return result_t::TEMPERROR;
+        if (v == "permerror" || v == "perm_error" || v == "perm-error") return result_t::PERMERROR;
+        if (v == "policy") return result_t::POLICY;
+        return result_t::UNKNOWN;
+    };
+
+    // Store raw header
+    auth_results_.raw = header_value;
+    auth_results_.present = true;
+
+    // Split tokens by ';' and skip the first (authserv-id)
+    vector<string> tokens;
+    split(tokens, header_value, [](char c){ return c == ';'; });
+    if (!tokens.empty()) tokens.erase(tokens.begin());
+
+    static const regex mech_regex{R"(^\s*([a-zA-Z0-9_-]+)\s*=\s*([a-zA-Z0-9_-]+))"};
+    static const regex dom_param_regex{R"((?:header\.d|smtp\.mailfrom|header\.from|d)\s*=\s*([^;\s\)]+))"};
+
+    std::size_t known_count = 0;
+    std::size_t valid_count = 0;
+
+    for (auto& tok : tokens)
+    {
+        string seg = trim_copy(tok);
+        if (seg.empty()) continue;
+        smatch m;
+    if (!regex_search(seg, m, mech_regex)) continue;
+    string mech = boost::to_lower_copy(m[1].str());
+    string val = m[2].str();
+        auto res = to_result(val);
+
+        smatch dm;
+        string dom;
+    if (regex_search(seg, dm, dom_param_regex)) dom = dm[1].str();
+
+        auto is_valid = [&](result_t r){
+            return r == result_t::PASS || r == result_t::FAIL || r == result_t::SOFTFAIL || r == result_t::NEUTRAL ||
+                   r == result_t::TEMPERROR || r == result_t::PERMERROR || r == result_t::POLICY; };
+
+        if (mech == "spf")
+        {
+            known_count++;
+            if (is_valid(res)) valid_count++;
+            auth_results_.spf = res;
+            if (!dom.empty()) auth_results_.spf_domain = dom;
+        }
+        else if (mech == "dkim")
+        {
+            known_count++;
+            if (is_valid(res)) valid_count++;
+            auth_results_.dkim = res;
+            if (!dom.empty()) auth_results_.dkim_domain = dom;
+        }
+        else if (mech == "dmarc")
+        {
+            known_count++;
+            if (is_valid(res)) valid_count++;
+            auth_results_.dmarc = res;
+            if (!dom.empty()) auth_results_.dmarc_domain = dom;
+        }
+    }
+
+    // If parsing failed to extract any recognized mechanisms or none had a valid result, mark suspicious in non-strict mode
+    if (!strict_mode_ && (known_count == 0 || valid_count == 0))
+        suspicious_ = true;
 }
 
 

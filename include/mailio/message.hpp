@@ -26,6 +26,7 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <memory>
 #include <tuple>
 #include <istream>
+#include <map>
 #include <boost/date_time.hpp>
 #include "q_codec.hpp"
 #include "mime.hpp"
@@ -156,6 +157,27 @@ public:
     @return True if empty, false if not.
     **/
     bool empty() const;
+
+    // Message-level authentication results derived from Authentication-Results
+    struct authentication_results_t
+    {
+        enum class result_t { NONE, PASS, FAIL, SOFTFAIL, NEUTRAL, TEMPERROR, PERMERROR, POLICY, UNKNOWN };
+
+        result_t spf{result_t::NONE};
+        result_t dkim{result_t::NONE};
+        result_t dmarc{result_t::NONE};
+        std::string spf_domain;
+        std::string dkim_domain;
+        std::string dmarc_domain;
+        std::string raw; // Raw Authentication-Results header captured
+        bool present{false};
+    };
+
+    // Access the parsed authentication results for this message
+    const authentication_results_t& authentication_results() const { return auth_results_; }
+
+    // Whether the message looks suspicious due to header parsing fallbacks or malformed critical headers
+    bool suspicious() const { return suspicious_; }
 
     /**
     Setting the author to a given address.
@@ -607,6 +629,11 @@ protected:
     static const std::string MIME_VERSION_HEADER;
 
     /**
+    `Authentication-Results` header name.
+    **/
+    static const std::string AUTHENTICATION_RESULTS_HEADER;
+
+    /**
     Formatting the header to a string.
 
     @return              Header as string.
@@ -627,6 +654,12 @@ protected:
                          `parse_address_list(const string&)`, `parse_subject(const string&)`, `parse_date(const string&)`.
     **/
     virtual void parse_header_line(const std::string& header_line);
+
+    /**
+    Parse Authentication-Results and populate message-level authentication flags.
+    Conservative best-effort: extracts spf/dkim/dmarc results and associated domains.
+    **/
+    void parse_authentication_results(const std::string& header_value);
 
     /**
     Formatting a list of addresses to string.
@@ -797,6 +830,12 @@ protected:
     
     bool error_state_{false};
     std::string error_{};
+    
+    // Parsed Authentication-Results
+    authentication_results_t auth_results_{};
+
+    // Flag indicating potential abuse based on parsing anomalies in non-strict mode
+    bool suspicious_{false};
     
 };
 

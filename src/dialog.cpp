@@ -148,6 +148,34 @@ string dialog::receive_bytes(std::size_t total_bytes, std::size_t chunk_size)
         return receive_exact_async(*socket_, total_bytes, chunk_size);
 }
 
+void dialog::close() noexcept
+{
+    try
+    {
+        if (closed_)
+            return;
+        closed_ = true;
+        // Cancel timer if present to avoid any future callbacks.
+        if (timer_ && timer_armed_)
+        {
+            try { timer_->cancel(); } catch (...) {}
+            timer_armed_ = false;
+        }
+
+        // Shutdown and close the socket best-effort.
+        if (socket_)
+        {
+            boost::system::error_code ec_ignore;
+            socket_->shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec_ignore);
+            socket_->close(ec_ignore);
+        }
+    }
+    catch (...)
+    {
+        // Never throw from cleanup.
+    }
+}
+
 
 template<typename Socket>
 void dialog::send_sync(Socket& socket, const string& line)
@@ -342,8 +370,11 @@ void dialog::wait_async(const bool& has_op, const bool& op_error, const char* ex
     }
     while (!has_op);
     // Cancel any pending timer to avoid stray callbacks after the operation completed.
-    if (timer_)
-        timer_->cancel();
+    if (timer_ && timer_armed_)
+    {
+        try { timer_->cancel(); } catch (...) {}
+        timer_armed_ = false;
+    }
 }
 
 
@@ -352,7 +383,20 @@ void dialog::check_timeout()
     // Expiring automatically cancels the timer, per documentation.
     timer_->expires_after(timeout_);
     timer_expired_ = false;
-    timer_->async_wait(bind(&dialog::timeout_handler, shared_from_this(), std::placeholders::_1));
+    // Use weak capture to avoid extending lifetime and to prevent callbacks touching
+    // a destroyed object during teardown.
+    std::weak_ptr<dialog> self_w = weak_from_this();
+    timer_armed_ = true;
+    timer_->async_wait([self_w](const error_code& ec)
+    {
+        if (auto self = self_w.lock())
+        {
+            // If close() ran and disarmed the timer, ignore late callbacks.
+            if (!self->timer_armed_)
+                return;
+            self->timeout_handler(ec);
+        }
+    });
 }
 
 

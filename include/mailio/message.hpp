@@ -379,10 +379,36 @@ public:
     std::string message_id() const;
 
     
+    /**
+    Set the IMAP unique identifier (UID) for this message.
+
+    The UID is assigned by the server and remains stable across sessions.
+
+    @param uid Unique identifier value reported by the server.
+    */
     void uid(unsigned long uid);
+
+    /**
+    Get the IMAP unique identifier (UID) of this message.
+
+    @return UID value, or 0 if not known.
+    */
     unsigned long uid() const;
     
+    /**
+    Set the message sequence number in the currently selected mailbox.
+
+    Sequence numbers are session-scoped and can change after expunge.
+
+    @param no Message sequence number.
+    */
     void sequence_no(unsigned long no);
+
+    /**
+    Get the message sequence number in the currently selected mailbox.
+
+    @return Sequence number, or 0 if not known.
+    */
     unsigned long sequence_no() const;
     
     /**
@@ -545,10 +571,35 @@ public:
     const headers_t& headers() const;
 
     
+    /**
+    Set the error state flag for this message.
+
+    This can be used by callers to mark messages that required fallbacks
+    or had parsing/validation anomalies.
+
+    @param value True if the message has errors; false otherwise.
+    */
     void error_state(bool value);
+
+    /**
+    Get the error state flag for this message.
+
+    @return True if the message has errors; false otherwise.
+    */
     bool error_state() const;
     
+    /**
+    Set a human-readable error description for this message.
+
+    @param value Error description text.
+    */
     void error(const std::string& value);
+
+    /**
+    Get the human-readable error description for this message.
+
+    @return Error description text; empty if none.
+    */
     const std::string& error() const;
     
 protected:
@@ -799,8 +850,19 @@ protected:
     **/
     std::string message_id_;
 
+    /**
+    Message sequence number in the selected mailbox (0 if unknown).
+    */
     unsigned long sequence_no_;
+
+    /**
+    Message unique identifier (UID) assigned by the server (0 if unknown).
+    */
     unsigned long message_uid_;
+
+    /**
+    Optional deduplication hash computed from the raw message bytes.
+    */
     std::string dedupe_hash_;
     
     /**
@@ -828,7 +890,14 @@ protected:
     **/
     headers_t headers_;
     
+    /**
+    Flag indicating that parsing/validation errors were observed.
+    */
     bool error_state_{false};
+
+    /**
+    Optional human-readable error description for diagnostics.
+    */
     std::string error_{};
     
     // Parsed Authentication-Results

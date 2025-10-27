@@ -214,7 +214,9 @@ imap::~imap()
 {
     try
     {
-        dlg_->send(format("LOGOUT"));
+        // Best-effort cleanup only: do not perform protocol I/O here.
+        if (dlg_)
+            dlg_->close();
     }
     catch (...)
     {

@@ -60,7 +60,8 @@ smtp::~smtp()
 {
     try
     {
-        dlg_->send("QUIT");
+        if (dlg_)
+            dlg_->close();
     }
     catch (...)
     {

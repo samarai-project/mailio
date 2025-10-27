@@ -104,6 +104,15 @@ public:
     **/
     virtual std::string receive_bytes(std::size_t total_bytes, std::size_t chunk_size = 32 * 1024);
 
+    /**
+    Best-effort cleanup: cancel timers and close the socket without throwing.
+
+    Ensures there are no active timers associated with this dialog. Uses
+    non-throwing operations and swallows any internal errors. Safe to call
+    multiple times and from destructors.
+    */
+    void close() noexcept;
+
 #ifdef MAILIO_TEST_HOOKS
 
     /**
@@ -269,6 +278,11 @@ protected:
     bool timer_expired_;
 
     /**
+    True if an async_wait has been started on the timer and not yet completed/canceled.
+    */
+    bool timer_armed_ = false;
+
+    /**
     Stream buffer associated to the socket.
     **/
     std::shared_ptr<boost::asio::streambuf> strmbuf_;
@@ -277,6 +291,11 @@ protected:
     Input stream associated to the buffer.
     **/
     std::shared_ptr<std::istream> istrm_;
+
+    /**
+    Idempotence guard to ensure close() runs only once.
+    */
+    bool closed_ = false;
 
 #ifdef MAILIO_TEST_HOOKS
     simulated_error_t sim_error_ = simulated_error_t::NONE;

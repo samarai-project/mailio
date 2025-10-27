@@ -600,10 +600,39 @@ public:
     @throw imap_error If the server returns NO/BAD or if parsing fails.
     */
     void noop();
+    
+    /**
+    Enable or disable strict IMAP parsing and validation.
 
+    When enabled, parsing is less tolerant to non-conforming server responses and
+    may raise errors where a best-effort fallback would otherwise be used.
+
+    @param mode True to enable strict parsing; false to use best-effort behavior.
+    */
     void strict_mode(bool mode);
+
+    /**
+    Enable or disable strict codec behavior for MIME/header decoding.
+
+    When enabled, MIME and header codecs adhere strictly to RFCs; malformed
+    encodings will cause errors rather than best-effort decoding.
+
+    @param mode True to enable strict codec mode; false for permissive decoding.
+    */
     void strict_codec_mode(bool mode);
+
+    /**
+    Get whether strict IMAP parsing is enabled.
+
+    @return True if strict mode is enabled; false otherwise.
+    */
     bool strict_mode() const;
+
+    /**
+    Get whether strict codec mode is enabled.
+
+    @return True if strict codec mode is enabled; false otherwise.
+    */
     bool strict_codec_mode() const;    
     
 #ifdef MAILIO_TEST_HOOKS
@@ -756,6 +785,14 @@ protected:
     @todo             Add server error messages to exceptions.
     **/
     void auth_login(const std::string& username, const std::string& password);
+    
+    /**
+    Perform XOAUTH2 authentication using a bearer access token.
+
+    @param username      Account identifier (often the email address).
+    @param access_token  OAuth2 bearer token to present to the server.
+    @throw imap_error    Authentication failure or parsing failure.
+    */
     void auth_login_xoauth2(const std::string &username, const std::string &access_token);
 
     /**
@@ -1009,7 +1046,14 @@ protected:
     **/
     std::string::size_type eols_no_;
     
+    /**
+    Flag indicating strict IMAP response parsing.
+    */
     bool strict_mode_ = false;
+
+    /**
+    Flag indicating strict codec behavior for MIME/header decoding.
+    */
     bool strict_codec_mode_ = false;
     
 };

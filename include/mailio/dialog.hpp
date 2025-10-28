@@ -17,6 +17,7 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <stdexcept>
 #include <chrono>
 #include <memory>
+#include <atomic>
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/streambuf.hpp>
@@ -103,6 +104,27 @@ public:
     @throw *            `receive_exact_sync<Socket>(Socket&, std::size_t)`, `receive_exact_async<Socket>(Socket&, std::size_t, std::size_t)`.
     **/
     virtual std::string receive_bytes(std::size_t total_bytes, std::size_t chunk_size = 32 * 1024);
+
+    /**
+    Set the I/O timeout used for subsequent network operations.
+
+    Note: If a timed async operation is already in flight, changing the timeout here
+    does not affect the already-armed timer; it will apply to the next operation.
+    */
+    void set_timeout(std::chrono::milliseconds timeout) { timeout_ = timeout; }
+
+    /** Get the current I/O timeout. */
+    std::chrono::milliseconds timeout() const { return timeout_; }
+
+    /**
+    Abort any in-flight or future I/O immediately and close the socket.
+
+    After this call, any pending or subsequent send/receive operations will
+    throw a dialog_planned_disconnect error to indicate an intentional abort.
+    This function is thread-safe to call while another thread is blocked in
+    receive()/send(); it will unstick the operation promptly.
+    */
+    void abort_now() noexcept;
 
     /**
     Best-effort cleanup: cancel timers and close the socket without throwing.
@@ -297,6 +319,12 @@ protected:
     */
     bool closed_ = false;
 
+    /**
+    Set when a planned disconnect has been requested. Checked by I/O paths
+    to fail fast with a distinct error instead of generic network errors.
+    */
+    std::atomic<bool> aborted_{false};
+
 #ifdef MAILIO_TEST_HOOKS
     simulated_error_t sim_error_ = simulated_error_t::NONE;
     int sim_error_count_ = 0;
@@ -466,6 +494,16 @@ protected:
     Message provided by Asio.
     **/
     std::string details_;
+};
+
+/**
+Distinct error used to signal that an operation was aborted due to an
+intentional client disconnect (as opposed to a network failure or timeout).
+*/
+class dialog_planned_disconnect : public dialog_error
+{
+public:
+    using dialog_error::dialog_error;
 };
 
 

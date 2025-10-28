@@ -93,6 +93,8 @@ void dialog::connect()
 
 void dialog::send(const string& line)
 {
+    if (aborted_.load(std::memory_order_acquire))
+        throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
 #ifdef MAILIO_TEST_HOOKS
     if (sim_error_count_ > 0 && (sim_error_ == simulated_error_t::SEND_FAIL || sim_error_ == simulated_error_t::TIMEOUT_SEND))
     {
@@ -113,6 +115,8 @@ void dialog::send(const string& line)
 // TODO: perhaps the implementation should be common with `receive_raw()`
 string dialog::receive(bool raw)
 {
+    if (aborted_.load(std::memory_order_acquire))
+        throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
 #ifdef MAILIO_TEST_HOOKS
     if (sim_error_count_ > 0 && (sim_error_ == simulated_error_t::RECV_FAIL || sim_error_ == simulated_error_t::TIMEOUT_RECV))
     {
@@ -132,6 +136,8 @@ string dialog::receive(bool raw)
 
 string dialog::receive_bytes(std::size_t total_bytes, std::size_t chunk_size)
 {
+    if (aborted_.load(std::memory_order_acquire))
+        throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
 #ifdef MAILIO_TEST_HOOKS
     if (sim_error_count_ > 0 && (sim_error_ == simulated_error_t::RECV_FAIL || sim_error_ == simulated_error_t::TIMEOUT_RECV))
     {
@@ -155,6 +161,7 @@ void dialog::close() noexcept
         if (closed_)
             return;
         closed_ = true;
+        aborted_.store(true, std::memory_order_release);
         // Cancel timer if present to avoid any future callbacks.
         if (timer_ && timer_armed_)
         {
@@ -173,6 +180,33 @@ void dialog::close() noexcept
     catch (...)
     {
         // Never throw from cleanup.
+    }
+}
+
+void dialog::abort_now() noexcept
+{
+    // Mark as aborted and close transport immediately to wake any blocking ops.
+    aborted_.store(true, std::memory_order_release);
+    try
+    {
+        // Best-effort cancel timer
+        if (timer_ && timer_armed_)
+        {
+            try { timer_->cancel(); } catch (...) {}
+            timer_armed_ = false;
+        }
+        if (socket_)
+        {
+            boost::system::error_code ec_ignore;
+            socket_->cancel(ec_ignore);
+            socket_->shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec_ignore);
+            socket_->close(ec_ignore);
+        }
+        closed_ = true;
+    }
+    catch (...)
+    {
+        // swallow
     }
 }
 
@@ -433,6 +467,8 @@ dialog_ssl::dialog_ssl(const dialog& other, const ssl_options_t& options) : dial
 
 void dialog_ssl::send(const string& line)
 {
+    if (aborted_.load(std::memory_order_acquire))
+        throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
     if (!ssl_)
     {
         dialog::send(line);
@@ -448,6 +484,8 @@ void dialog_ssl::send(const string& line)
 
 string dialog_ssl::receive(bool raw)
 {
+    if (aborted_.load(std::memory_order_acquire))
+        throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
     if (!ssl_)
         return dialog::receive(raw);
 
@@ -467,6 +505,8 @@ string dialog_ssl::receive(bool raw)
 
 string dialog_ssl::receive_bytes(std::size_t total_bytes, std::size_t chunk_size)
 {
+    if (aborted_.load(std::memory_order_acquire))
+        throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
     if (!ssl_)
         return dialog::receive_bytes(total_bytes, chunk_size);
 

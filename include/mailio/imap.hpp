@@ -28,6 +28,8 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <variant>
 #include <optional>
 #include <vector>
+#include <functional>
+#include <atomic>
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/streambuf.hpp>
@@ -412,7 +414,70 @@ public:
     @throw *           `parse_tag_result(const string&)`, `dialog::send(const string&)`, `dialog::receive()`.
     @todo              Add server error messages to exceptions.
     **/
-    void search(const std::list<search_condition_t>& conditions, std::list<unsigned long>& results, bool want_uids = false);
+    void search(const std::list<search_condition_t> &conditions, std::list<unsigned long> &results, bool want_uids = false);
+
+    /**
+    Enter the IMAP IDLE state and surface untagged updates.
+
+    Requirements and behavior:
+    - A mailbox must already be selected (SELECT/EXAMINE).
+    - While IDLE is active, the only valid command on this connection is DONE. Do not call other methods concurrently.
+    - The callback is invoked for each untagged event of interest. Return true to continue idling, false to stop.
+    - The call exits if cancel flag becomes true, the callback returns false, max_idle duration elapses (if non-zero),
+        or the server ends the session. In all cases, DONE is sent and the tagged completion is consumed before return.
+
+    @param on_event   Callback receiving event info; return false to end the IDLE session.
+    @param max_idle   Maximum time to remain in IDLE before returning. If zero, use the dialog timeout as the only guard.
+    @param cancel     Cancellation flag checked between receives; set to true to request exit.
+    @throw imap_error On protocol or parsing errors, or if the server responds with BAD/NO.
+    */
+    struct idle_event_t
+    {
+        enum class type_t
+        {
+            EXISTS,
+            EXPUNGE,
+            RECENT,
+            FETCH_FLAGS,
+            BYE,
+            OTHER
+        } type;
+        // Numeric payload when present (message sequence number etc.). 0 if not applicable.
+        unsigned long number{0};
+        // Raw untagged response text (without tag/result), best-effort for diagnostics.
+        std::string raw;
+    };
+    void idle(const std::function<bool(const idle_event_t &)> &on_event,
+              std::chrono::milliseconds max_idle,
+              const std::atomic_bool &cancel,
+              std::optional<std::chrono::milliseconds> io_timeout_override = std::nullopt);
+
+        /**
+        Gracefully disconnect from the server within a bounded timeout.
+
+        Behavior:
+        - If currently in IDLE, send DONE and wait up to the given timeout for the tagged OK.
+        - Regardless of server response, abort pending I/O and close the socket so
+            callers are not blocked during shutdown.
+        - Any in-flight or subsequent IMAP operations will throw imap_planned_disconnect
+            to signal an intentional shutdown.
+
+        @param timeout Maximum time to spend attempting a graceful DONE. Defaults to 200ms.
+        */
+        void disconnect(std::chrono::milliseconds timeout = std::chrono::milliseconds(200));
+
+    /**
+    Adjust the underlying dialog timeout for subsequent IMAP I/O.
+
+    Useful to shorten timeouts during connect/auth/select, and lengthen when
+    entering long-lived IDLE.
+    */
+    void set_timeout(std::chrono::milliseconds timeout)
+    {
+        if (dlg_)
+            dlg_->set_timeout(timeout);
+    }
+    std::chrono::milliseconds timeout() const { return dlg_ ? dlg_->timeout() : std::chrono::milliseconds(0); }
 
     /**
     Creating folder.
@@ -930,6 +995,11 @@ protected:
     **/
     std::shared_ptr<dialog> dlg_;
 
+    /** True while inside idle() main loop after server continuation received. */
+    std::atomic<bool> is_idling_{false};
+    /** Set when a planned disconnect is underway to alter behavior (skip DONE on errors). */
+    std::atomic<bool> planned_disconnect_{false};
+
     /**
     SSL options to set.
     **/
@@ -1153,6 +1223,15 @@ public:
     imap_error& operator=(const imap_error&) = default;
 
     imap_error& operator=(imap_error&&) = default;
+};
+
+/**
+Error thrown by IMAP when operations are aborted due to an intentional disconnect.
+*/
+class imap_planned_disconnect : public imap_error
+{
+public:
+    using imap_error::imap_error;
 };
 
 

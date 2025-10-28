@@ -48,6 +48,8 @@ using std::to_string;
 using std::tuple;
 using std::vector;
 using std::chrono::milliseconds;
+using std::chrono::steady_clock;
+using std::chrono::duration_cast;
 using boost::system::system_error;
 using boost::iequals;
 using boost::istarts_with;
@@ -1560,6 +1562,199 @@ string imap::folder_delimiter()
     {
         throw imap_error("Parsing failure.", exc.what());
     }
+}
+
+void imap::idle(const std::function<bool(const idle_event_t&)>& on_event,
+                std::chrono::milliseconds max_idle,
+                const std::atomic_bool& cancel,
+                std::optional<std::chrono::milliseconds> io_timeout_override)
+{
+    // Optionally override I/O timeout for the duration of IDLE
+    std::optional<std::chrono::milliseconds> prev_timeout;
+    if (io_timeout_override.has_value())
+    {
+        prev_timeout = dlg_->timeout();
+        dlg_->set_timeout(*io_timeout_override);
+    }
+    // Send IDLE and wait for continuation response ('+ ...').
+    dlg_->send(format("IDLE"));
+    // Expect a continuation line starting with '+'; servers may include text after it.
+    {
+        string line = dlg_->receive();
+        tag_result_response_t parsed = parse_tag_result(line);
+        if (parsed.tag != CONTINUE_RESPONSE)
+            throw imap_error("IDLE refused by server.", "Line=`" + line + "`.");
+    }
+
+    is_idling_.store(true, std::memory_order_release);
+    auto start_tp = steady_clock::now();
+    bool keep_running = true;
+    try
+    {
+        while (keep_running)
+        {
+            if (cancel)
+                break;
+            if (max_idle.count() > 0)
+            {
+                auto elapsed = duration_cast<milliseconds>(steady_clock::now() - start_tp);
+                if (elapsed >= max_idle)
+                    break;
+            }
+
+            reset_response_parser();
+            string line = dlg_->receive();
+            tag_result_response_t parsed_line = parse_tag_result(line);
+
+            if (parsed_line.tag == UNTAGGED_RESPONSE)
+            {
+                // Parse and classify common untagged updates
+                idle_event_t ev{ idle_event_t::type_t::OTHER, 0, parsed_line.response };
+                try
+                {
+                    parse_response(parsed_line.response);
+                    if (!mandatory_part_.empty())
+                    {
+                        auto head = mandatory_part_.front();
+                        if (head->token_type == response_token_t::token_type_t::ATOM)
+                        {
+                            // Some events like BYE arrive as: * BYE reason
+                            if (iequals(head->atom, "BYE"))
+                            {
+                                ev.type = idle_event_t::type_t::BYE;
+                            }
+                        }
+                        else if (head->token_type == response_token_t::token_type_t::ATOM /* actually number as atom */)
+                        {
+                            // Not reachable: numeric comes as ATOM too; handle below.
+                        }
+                    }
+                    // Numeric form: "* <n> EXISTS|RECENT|EXPUNGE ..."
+                    if (!mandatory_part_.empty())
+                    {
+                        auto it = mandatory_part_.begin();
+                        if ((*it)->token_type == response_token_t::token_type_t::ATOM)
+                        {
+                            unsigned long num = 0;
+                            try { num = stoul((*it)->atom); } catch (...) { num = 0; }
+                            if (num > 0)
+                            {
+                                ++it;
+                                if (it != mandatory_part_.end() && (*it)->token_type == response_token_t::token_type_t::ATOM)
+                                {
+                                    if (iequals((*it)->atom, "EXISTS"))
+                                        { ev.type = idle_event_t::type_t::EXISTS; ev.number = num; }
+                                    else if (iequals((*it)->atom, "RECENT"))
+                                        { ev.type = idle_event_t::type_t::RECENT; ev.number = num; }
+                                    else if (iequals((*it)->atom, "EXPUNGE"))
+                                        { ev.type = idle_event_t::type_t::EXPUNGE; ev.number = num; }
+                                    else if (iequals((*it)->atom, "FETCH"))
+                                        { ev.type = idle_event_t::type_t::FETCH_FLAGS; ev.number = num; }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (...)
+                {
+                    // Ignore parse issues for untagged during IDLE; keep raw in ev.raw
+                    reset_response_parser();
+                }
+                if (on_event)
+                {
+                    keep_running = on_event(ev);
+                }
+            }
+            else if (parsed_line.tag == to_string(tag_))
+            {
+                // Server should not send tagged response while we are idling unless DONE was sent; treat as completion.
+                break;
+            }
+            else if (parsed_line.tag == CONTINUE_RESPONSE)
+            {
+                // Some servers may send nested continuations; ignore silently.
+                continue;
+            }
+        }
+    }
+    catch (const invalid_argument& exc)
+    {
+        if (!planned_disconnect_.load(std::memory_order_acquire))
+        {
+            // Terminate IDLE with DONE before surfacing error
+            dlg_->send("DONE");
+            // Consume the tagged completion line
+            string line = dlg_->receive();
+            (void)parse_tag_result(line);
+        }
+        throw imap_error("Parsing failure.", exc.what());
+    }
+    catch (const out_of_range& exc)
+    {
+        if (!planned_disconnect_.load(std::memory_order_acquire))
+        {
+            dlg_->send("DONE");
+            string line = dlg_->receive();
+            (void)parse_tag_result(line);
+        }
+        throw imap_error("Parsing failure.", exc.what());
+    }
+
+    // Exit IDLE cleanly
+    if (!planned_disconnect_.load(std::memory_order_acquire))
+    {
+        dlg_->send("DONE");
+        // Expect a tagged OK for the IDLE command we started earlier.
+        {
+            string line = dlg_->receive();
+            tag_result_response_t parsed = parse_tag_result(line);
+            if (parsed.tag != to_string(tag_) || !parsed.result.has_value() || parsed.result.value() != tag_result_response_t::OK)
+                throw imap_error("IDLE completion failure.", "Response=`" + parsed.response + "`.");
+        }
+    }
+    reset_response_parser();
+    // Restore previous timeout if we overrode it
+    if (prev_timeout.has_value())
+        dlg_->set_timeout(*prev_timeout);
+    is_idling_.store(false, std::memory_order_release);
+}
+
+void imap::disconnect(std::chrono::milliseconds timeout)
+{
+    // Mark planned disconnect to alter behavior (skip DONE on catch paths) and propagate distinct error.
+    planned_disconnect_.store(true, std::memory_order_release);
+
+    // Best-effort: if we're idling, try to send DONE and wait briefly for completion.
+    bool try_done = is_idling_.load(std::memory_order_acquire);
+    if (try_done)
+    {
+        try
+        {
+            dlg_->send("DONE");
+            // Wait up to timeout for tagged OK; use dialog timeout temporarily if non-zero
+            auto prev = dlg_->timeout();
+            if (timeout.count() > 0)
+                dlg_->set_timeout(timeout);
+            try
+            {
+                string line = dlg_->receive();
+                (void)parse_tag_result(line);
+            }
+            catch (...)
+            {
+                // Ignore; we'll abort regardless
+            }
+            if (timeout.count() > 0)
+                dlg_->set_timeout(prev);
+        }
+        catch (...)
+        {
+            // Ignore send failures
+        }
+    }
+
+    // In all cases, abort I/O immediately to guarantee quick exit of any blocked operations.
+    dlg_->abort_now();
 }
 
 void imap::noop()

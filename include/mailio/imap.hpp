@@ -452,19 +452,19 @@ public:
               const std::atomic_bool &cancel,
               std::optional<std::chrono::milliseconds> io_timeout_override = std::nullopt);
 
-        /**
-        Gracefully disconnect from the server within a bounded timeout.
+    /**
+    Gracefully disconnect from the server within a bounded timeout.
 
-        Behavior:
-        - If currently in IDLE, send DONE and wait up to the given timeout for the tagged OK.
-        - Regardless of server response, abort pending I/O and close the socket so
-            callers are not blocked during shutdown.
-        - Any in-flight or subsequent IMAP operations will throw imap_planned_disconnect
-            to signal an intentional shutdown.
+    Behavior:
+    - If currently in IDLE, send DONE and wait up to the given timeout for the tagged OK.
+    - Regardless of server response, abort pending I/O and close the socket so
+        callers are not blocked during shutdown.
+    - Any in-flight or subsequent IMAP operations will throw imap_planned_disconnect
+        to signal an intentional shutdown.
 
-        @param timeout Maximum time to spend attempting a graceful DONE. Defaults to 200ms.
-        */
-        void disconnect(std::chrono::milliseconds timeout = std::chrono::milliseconds(200));
+    @param timeout Maximum time to spend attempting a graceful DONE. Defaults to 200ms.
+    */
+    void disconnect(std::chrono::milliseconds timeout = std::chrono::milliseconds(200));
 
     /**
     Adjust the underlying dialog timeout for subsequent IMAP I/O.
@@ -997,6 +997,7 @@ protected:
 
     /** True while inside idle() main loop after server continuation received. */
     std::atomic<bool> is_idling_{false};
+    
     /** Set when a planned disconnect is underway to alter behavior (skip DONE on errors). */
     std::atomic<bool> planned_disconnect_{false};
 

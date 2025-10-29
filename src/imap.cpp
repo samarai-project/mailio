@@ -1687,6 +1687,7 @@ void imap::idle(const std::function<bool(const idle_event_t&)>& on_event,
             string line = dlg_->receive();
             (void)parse_tag_result(line);
         }
+        is_idling_.store(false, std::memory_order_release);
         throw imap_error("Parsing failure.", exc.what());
     }
     catch (const out_of_range& exc)
@@ -1697,7 +1698,17 @@ void imap::idle(const std::function<bool(const idle_event_t&)>& on_event,
             string line = dlg_->receive();
             (void)parse_tag_result(line);
         }
+        is_idling_.store(false, std::memory_order_release);
         throw imap_error("Parsing failure.", exc.what());
+    }
+    catch (...)
+    {
+        if (!planned_disconnect_.load(std::memory_order_acquire)) {
+            is_idling_.store(false, std::memory_order_release);
+            throw;
+        }
+        is_idling_.store(false, std::memory_order_release);
+        return;
     }
 
     // Exit IDLE cleanly
@@ -1708,8 +1719,10 @@ void imap::idle(const std::function<bool(const idle_event_t&)>& on_event,
         {
             string line = dlg_->receive();
             tag_result_response_t parsed = parse_tag_result(line);
-            if (parsed.tag != to_string(tag_) || !parsed.result.has_value() || parsed.result.value() != tag_result_response_t::OK)
+            if (parsed.tag != to_string(tag_) || !parsed.result.has_value() || parsed.result.value() != tag_result_response_t::OK) {
+                is_idling_.store(false, std::memory_order_release);
                 throw imap_error("IDLE completion failure.", "Response=`" + parsed.response + "`.");
+            }
         }
     }
     reset_response_parser();
@@ -1721,40 +1734,14 @@ void imap::idle(const std::function<bool(const idle_event_t&)>& on_event,
 
 void imap::disconnect(std::chrono::milliseconds timeout)
 {
-    // Mark planned disconnect to alter behavior (skip DONE on catch paths) and propagate distinct error.
-    planned_disconnect_.store(true, std::memory_order_release);
-
-    // Best-effort: if we're idling, try to send DONE and wait briefly for completion.
-    bool try_done = is_idling_.load(std::memory_order_acquire);
-    if (try_done)
-    {
-        try
-        {
-            dlg_->send("DONE");
-            // Wait up to timeout for tagged OK; use dialog timeout temporarily if non-zero
-            auto prev = dlg_->timeout();
-            if (timeout.count() > 0)
-                dlg_->set_timeout(timeout);
-            try
-            {
-                string line = dlg_->receive();
-                (void)parse_tag_result(line);
-            }
-            catch (...)
-            {
-                // Ignore; we'll abort regardless
-            }
-            if (timeout.count() > 0)
-                dlg_->set_timeout(prev);
-        }
-        catch (...)
-        {
-            // Ignore send failures
-        }
-    }
-
+    
+    // If already planning a disconnect, do nothing.
+    if (planned_disconnect_.exchange(true, std::memory_order_acq_rel))
+        return;
+ 
     // In all cases, abort I/O immediately to guarantee quick exit of any blocked operations.
-    dlg_->abort_now();
+    try { dlg_->abort_now(); } catch (...) { /* ignore */ }
+    
 }
 
 void imap::noop()

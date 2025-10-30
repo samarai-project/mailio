@@ -435,11 +435,11 @@ public:
     {
         enum class type_t
         {
-            EXISTS,
-            EXPUNGE,
-            RECENT,
-            FETCH_FLAGS,
-            BYE,
+            EXISTS,      // Signals a change in the total number of messages in the selected mailbox
+            EXPUNGE,     // Signals that a message has been permanently removed
+            RECENT,      // Informs about the number of messages with the \Recent flag
+            FETCH_FLAGS, // indicates a metadata change for a specific message
+            BYE,         // A "goodbye" from the server. The connection is about to be terminated
             OTHER
         } type;
         // Numeric payload when present (message sequence number etc.). 0 if not applicable.

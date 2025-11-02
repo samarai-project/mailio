@@ -44,7 +44,7 @@ namespace mailio
 {
 
 
-boost::asio::io_context dialog::ios_;
+// No global io_context; each dialog owns its own to avoid cross-thread interference.
 
 // Global log callback storage and synchronization.
 namespace {
@@ -89,31 +89,25 @@ std::string b64_encode(const std::string& value)
 }
 
 dialog::dialog(const string& hostname, unsigned port, milliseconds timeout) : std::enable_shared_from_this<dialog>(),
-    hostname_(hostname), port_(port), socket_(make_shared<tcp::socket>(ios_)), timer_(make_shared<steady_timer>(ios_)),
+    hostname_(hostname), port_(port), ios_(std::make_shared<io_context>()), socket_(make_shared<tcp::socket>(*ios_)), timer_(make_shared<steady_timer>(*ios_)),
     timeout_(timeout), timer_expired_(false), strmbuf_(make_shared<streambuf>()), istrm_(make_shared<istream>(strmbuf_.get()))
 {
-    debug_bugfix("dialog class constructed");
 }
 
 
 dialog::dialog(const dialog& other) : std::enable_shared_from_this<dialog>(),
-    hostname_(move(other.hostname_)), port_(other.port_), socket_(other.socket_), timer_(other.timer_),
-    timeout_(other.timeout_), timer_expired_(other.timer_expired_), strmbuf_(other.strmbuf_), istrm_(other.istrm_)
+    hostname_(move(other.hostname_)), port_(other.port_), ios_(other.ios_), socket_(other.socket_), timer_(other.timer_),
+    timeout_(other.timeout_), timer_expired_(other.timer_expired_.load()), strmbuf_(other.strmbuf_), istrm_(other.istrm_)
 {
-    debug_bugfix("dialog class constructed");
 }
-
-dialog::~dialog() {
-    debug_bugfix("dialog class destructed");
-}
-
+ 
 void dialog::connect()
 {
     try
     {
         if (timeout_.count() == 0)
         {
-            tcp::resolver res(ios_);
+            tcp::resolver res(*ios_);
             boost::asio::connect(*socket_, res.resolve(hostname_, to_string(port_)));
         }
         else
@@ -128,11 +122,7 @@ void dialog::connect()
 
 void dialog::send(const string& line)
 {
-    if (line.size() < 256) {
-        debug_bugfix("dialog::send: " + line);
-    } else {
-        debug_bugfix("dialog::send: " + line.substr(0, 255) + "...");
-    }
+    debug_bugfix("SEND", line, 256);
     if (aborted_.load(std::memory_order_acquire))
         throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
 #ifdef MAILIO_TEST_HOOKS
@@ -167,12 +157,14 @@ string dialog::receive(bool raw)
             throw dialog_error("Network receiving timed out.", "Simulated timeout");
     }
 #endif
+    string res{};
     if (timeout_.count() == 0)
-        return receive_sync(*socket_, raw);
+        res = receive_sync(*socket_, raw);
     else
-        return receive_async(*socket_, raw);
+        res = receive_async(*socket_, raw);
+    debug_bugfix("RECEIVE", res, 256);
+    return res;
 }
-
 
 string dialog::receive_bytes(std::size_t total_bytes, std::size_t chunk_size)
 {
@@ -203,10 +195,10 @@ void dialog::close() noexcept
         closed_ = true;
         aborted_.store(true, std::memory_order_release);
         // Cancel timer if present to avoid any future callbacks.
-        if (timer_ && timer_armed_)
+        if (timer_ && timer_armed_.load())
         {
             try { timer_->cancel(); } catch (...) {}
-            timer_armed_ = false;
+            timer_armed_.store(false, std::memory_order_release);
         }
 
         // Shutdown and close the socket best-effort.
@@ -230,10 +222,10 @@ void dialog::abort_now() noexcept
     try
     {
         // Best-effort cancel timer
-        if (timer_ && timer_armed_)
+        if (timer_ && timer_armed_.load())
         {
             try { timer_->cancel(); } catch (...) {}
-            timer_armed_ = false;
+            timer_armed_.store(false, std::memory_order_release);
         }
         if (socket_)
         {
@@ -287,7 +279,7 @@ string dialog::receive_sync(Socket& socket, bool raw)
 
 void dialog::connect_async()
 {
-    tcp::resolver res(ios_);
+    tcp::resolver res(*ios_);
     check_timeout();
     struct op_state { bool done{false}; bool error{false}; error_code ec; };
     auto st = std::make_shared<op_state>();
@@ -436,18 +428,18 @@ void dialog::wait_async(const bool& has_op, const bool& op_error, const char* ex
 {
     do
     {
-        if (timer_expired_)
+        if (timer_expired_.load(std::memory_order_acquire))
             throw dialog_error(expired_msg, error.message());
         if (op_error)
             throw dialog_error(op_msg, error.message());
-        ios_.run_one();
+        ios_->run_one();
     }
     while (!has_op);
     // Cancel any pending timer to avoid stray callbacks after the operation completed.
-    if (timer_ && timer_armed_)
+    if (timer_ && timer_armed_.load())
     {
         try { timer_->cancel(); } catch (...) {}
-        timer_armed_ = false;
+        timer_armed_.store(false, std::memory_order_release);
     }
 }
 
@@ -456,17 +448,17 @@ void dialog::check_timeout()
 {
     // Expiring automatically cancels the timer, per documentation.
     timer_->expires_after(timeout_);
-    timer_expired_ = false;
+    timer_expired_.store(false, std::memory_order_release);
     // Use weak capture to avoid extending lifetime and to prevent callbacks touching
     // a destroyed object during teardown.
     std::weak_ptr<dialog> self_w = weak_from_this();
-    timer_armed_ = true;
+    timer_armed_.store(true, std::memory_order_release);
     timer_->async_wait([self_w](const error_code& ec)
     {
         if (auto self = self_w.lock())
         {
             // If close() ran and disarmed the timer, ignore late callbacks.
-            if (!self->timer_armed_)
+            if (!self->timer_armed_.load())
                 return;
             self->timeout_handler(ec);
         }
@@ -477,7 +469,7 @@ void dialog::check_timeout()
 void dialog::timeout_handler(const error_code& error)
 {
     if (!error)
-        timer_expired_ = true;
+        timer_expired_.store(true, std::memory_order_release); 
 }
 
 
@@ -508,11 +500,7 @@ dialog_ssl::dialog_ssl(const dialog& other, const ssl_options_t& options) : dial
 void dialog_ssl::send(const string& line)
 {
     
-    if (line.size() < 256) {
-        debug_bugfix("dialog::send: " + line);
-    } else {
-        debug_bugfix("dialog::send: " + line.substr(0, 255) + "...");
-    }    
+    debug_bugfix("SEND", line, 256);
     
     if (aborted_.load(std::memory_order_acquire))
         throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
@@ -538,10 +526,13 @@ string dialog_ssl::receive(bool raw)
 
     try
     {
+        string res{};
         if (timeout_.count() == 0)
-            return receive_sync(*ssl_socket_, raw);
+            res = receive_sync(*ssl_socket_, raw);
         else
-            return receive_async(*ssl_socket_, raw);
+            res = receive_async(*ssl_socket_, raw);
+        debug_bugfix("RECEIVE", res, 256);
+        return res;
     }
     catch (const system_error& exc)
     {

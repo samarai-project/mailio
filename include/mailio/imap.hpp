@@ -374,6 +374,26 @@ public:
     unsigned long status_uidnext(const std::string& mailbox);
  
     /**
+    Get the UID corresponding to a given message sequence number in the currently selected mailbox.
+
+    The method issues:
+        FETCH <seq_no> (UID)
+    against the already selected mailbox and returns the UID value reported by
+    the server for that message. If the requested sequence number does not exist
+    (e.g., the mailbox is empty or seq_no is out of range), returns 0.
+
+    Notes:
+    - A mailbox must be selected prior to calling this method (e.g., via select()).
+    - On protocol or server errors (tagged NO/BAD unrelated to non-existence), an exception
+      is thrown; 0 is reserved for the "no such message" case.
+
+    @param seq_no      Message sequence number to query.
+    @return            UID for the message, or 0 if no such message.
+    @throw imap_error  Parsing failure or server error.
+    */
+    unsigned long uid_from_sequence_no(unsigned long seq_no);
+ 
+    /**
     Removing a message from the given mailbox.
 
     @param mailbox    Mailbox to use.
@@ -427,21 +447,7 @@ public:
     **/
     void search(const std::list<search_condition_t> &conditions, std::list<unsigned long> &results, bool want_uids = false);
 
-    /**
-    Enter the IMAP IDLE state and surface untagged updates.
-
-    Requirements and behavior:
-    - A mailbox must already be selected (SELECT/EXAMINE).
-    - While IDLE is active, the only valid command on this connection is DONE. Do not call other methods concurrently.
-    - The callback is invoked for each untagged event of interest. Return true to continue idling, false to stop.
-    - The call exits if cancel flag becomes true, the callback returns false, max_idle duration elapses (if non-zero),
-        or the server ends the session. In all cases, DONE is sent and the tagged completion is consumed before return.
-
-    @param on_event   Callback receiving event info; return false to end the IDLE session.
-    @param max_idle   Maximum time to remain in IDLE before returning. If zero, use the dialog timeout as the only guard.
-    @param cancel     Cancellation flag checked between receives; set to true to request exit.
-    @throw imap_error On protocol or parsing errors, or if the server responds with BAD/NO.
-    */
+ 
     struct idle_event_t
     {
         enum class type_t
@@ -450,7 +456,6 @@ public:
             EXPUNGE,     // Signals that a message has been permanently removed
             RECENT,      // Informs about the number of messages with the \Recent flag
             FETCH_FLAGS, // indicates a metadata change for a specific message
-            BYE,         // A "goodbye" from the server. The connection is about to be terminated
             OTHER
         } type;
         // Numeric payload when present (message sequence number etc.). 0 if not applicable.
@@ -458,10 +463,51 @@ public:
         // Raw untagged response text (without tag/result), best-effort for diagnostics.
         std::string raw;
     };
-    void idle(const std::function<bool(const idle_event_t &)> &on_event,
-              std::chrono::milliseconds max_idle,
-              const std::atomic_bool &cancel,
-              std::optional<std::chrono::milliseconds> io_timeout_override = std::nullopt);
+    enum class idle_result_t
+    {
+        EXPIRED,
+        BYE,
+    };
+        /**
+        Enter RFC 2177 IDLE and stream untagged mailbox updates to a callback.
+
+        Semantics and guarantees:
+        - Independent timeout: The idle timeout controls how long this method stays
+            in the IDLE state before returning idle_result_t::EXPIRED. It is completely
+            independent of the lower, short networking timeout configured on the dialog
+            (typically 10–20 seconds). A network timeout does NOT end IDLE by itself;
+            it is treated as transient inactivity and the loop continues until the
+            idle timeout elapses, cancellation is requested, a server BYE is received,
+            or a real networking error occurs.
+        - Best-effort parsing: Server untagged responses are parsed leniently.
+            Recognized events (EXISTS, EXPUNGE, RECENT, FETCH FLAGS) are reported via
+            idle_event_t. Unknown or malformed lines are delivered as OTHER with the
+            raw text preserved.
+        - Server BYE: If the server sends an untagged BYE, the method exits promptly
+            and returns idle_result_t::BYE.
+        - Exceptions: Networking errors other than timeouts are forwarded to the
+            caller (e.g., disconnects, protocol I/O failures). Parsing problems do not
+            throw; they are surfaced as OTHER events. The method itself avoids throwing
+            unless absolutely necessary to report a genuine networking issue.
+        - DONE handling: On natural exit (timeout or callback requests stop), the
+            method will send DONE and best-effort wait for the tagged completion to
+            keep the protocol state consistent. In the presence of planned disconnects
+            or time pressure, this is best-effort only.
+
+        @param on_event Callback invoked for each observed event. Return true to keep
+                                        idling, false to stop and return idle_result_t::EXPIRED.
+        @param timeout  Maximum duration to remain in IDLE before returning EXPIRED.
+        @param cancel   External cancellation flag checked between receives; when set
+                                        the method exits like a timeout with EXPIRED.
+        @return         idle_result_t::EXPIRED when the idle period ends normally or
+                                        cancellation is observed; idle_result_t::BYE when the server
+                                        closes the connection.
+        @throw *        Networking failures (other than timeouts) from the underlying
+                                        dialog are rethrown to the caller.
+        */
+        idle_result_t idle(const std::function<bool(const idle_event_t &)> &on_event,
+                                             std::chrono::milliseconds timeout,
+                                             const std::atomic_bool &cancel);
 
     /**
     Gracefully disconnect from the server within a bounded timeout.

@@ -48,6 +48,24 @@ inline void debug_bugfix(const std::string& text)
     call_log_callback_or_fallback(text);
 }
 
+inline void debug_bugfix(const std::string& text, size_t max)
+{
+    if (text.size() > max) {
+        debug_bugfix(text.substr(0, max) + "...");
+    } else {
+        debug_bugfix(text);
+    }
+}
+
+inline void debug_bugfix(const std::string& prefix, const std::string& text, size_t max)
+{
+    if (text.size() > max) {
+        debug_bugfix(prefix + ": " + text.substr(0, max) + "...");
+    } else {
+        debug_bugfix(prefix + ": " + text);
+    }
+}
+
 std::string b64_encode(const std::string& value);
 
 /**
@@ -78,7 +96,7 @@ public:
     /**
     Closing the connection.
     **/
-    virtual ~dialog();
+    virtual ~dialog() = default;
 
     dialog(dialog&&) = delete;
 
@@ -288,9 +306,11 @@ protected:
     const unsigned int port_;
 
     /**
-    Asio input/output service.
+    Asio input/output service for this dialog instance.
+    Kept as a shared_ptr so derived wrappers (e.g., SSL) created from this dialog
+    share the same io_context.
     **/
-    static boost::asio::io_context ios_;
+    std::shared_ptr<boost::asio::io_context> ios_;
 
     /**
     Socket connection.
@@ -312,12 +332,12 @@ protected:
 
     @todo Should be atomic?
     **/
-    bool timer_expired_;
+    std::atomic<bool> timer_expired_;
 
     /**
     True if an async_wait has been started on the timer and not yet completed/canceled.
     */
-    bool timer_armed_ = false;
+    std::atomic<bool> timer_armed_{false};
 
     /**
     Stream buffer associated to the socket.

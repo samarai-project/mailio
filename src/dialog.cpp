@@ -17,6 +17,7 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <boost/algorithm/string/classification.hpp>
 #include <mailio/dialog.hpp>
 #include <mailio/base64.hpp>
+#include <mutex>
 
 
 using std::string;
@@ -45,6 +46,35 @@ namespace mailio
 
 boost::asio::io_context dialog::ios_;
 
+// Global log callback storage and synchronization.
+namespace {
+    std::mutex g_log_mutex;
+    log_callback_t g_log_callback; // empty when no callback installed
+}
+
+void set_log_callback(log_callback_t cb)
+{
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    g_log_callback = std::move(cb);
+}
+
+void call_log_callback_or_fallback(const std::string& text)
+{
+    // Copy the callback under lock, then call without holding the mutex.
+    log_callback_t cb_copy;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        cb_copy = g_log_callback;
+    }
+    if (cb_copy)
+    {
+        cb_copy(text);
+        return;
+    }
+    // Fallback to stdout with a simple tag; avoid ANSI styling to keep portability.
+    std::cout << "[MAILIO] [BUGFIX] " << text << "\n";
+}
+
 std::string b64_encode(const std::string& value)
 {
     base64 b64(
@@ -62,6 +92,7 @@ dialog::dialog(const string& hostname, unsigned port, milliseconds timeout) : st
     hostname_(hostname), port_(port), socket_(make_shared<tcp::socket>(ios_)), timer_(make_shared<steady_timer>(ios_)),
     timeout_(timeout), timer_expired_(false), strmbuf_(make_shared<streambuf>()), istrm_(make_shared<istream>(strmbuf_.get()))
 {
+    debug_bugfix("dialog class constructed");
 }
 
 
@@ -69,8 +100,12 @@ dialog::dialog(const dialog& other) : std::enable_shared_from_this<dialog>(),
     hostname_(move(other.hostname_)), port_(other.port_), socket_(other.socket_), timer_(other.timer_),
     timeout_(other.timeout_), timer_expired_(other.timer_expired_), strmbuf_(other.strmbuf_), istrm_(other.istrm_)
 {
+    debug_bugfix("dialog class constructed");
 }
 
+dialog::~dialog() {
+    debug_bugfix("dialog class destructed");
+}
 
 void dialog::connect()
 {
@@ -93,6 +128,11 @@ void dialog::connect()
 
 void dialog::send(const string& line)
 {
+    if (line.size() < 256) {
+        debug_bugfix("dialog::send: " + line);
+    } else {
+        debug_bugfix("dialog::send: " + line.substr(0, 255) + "...");
+    }
     if (aborted_.load(std::memory_order_acquire))
         throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
 #ifdef MAILIO_TEST_HOOKS
@@ -467,6 +507,13 @@ dialog_ssl::dialog_ssl(const dialog& other, const ssl_options_t& options) : dial
 
 void dialog_ssl::send(const string& line)
 {
+    
+    if (line.size() < 256) {
+        debug_bugfix("dialog::send: " + line);
+    } else {
+        debug_bugfix("dialog::send: " + line.substr(0, 255) + "...");
+    }    
+    
     if (aborted_.load(std::memory_order_acquire))
         throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
     if (!ssl_)

@@ -363,6 +363,17 @@ public:
     mailbox_stat_t statistics(const std::list<std::string>& folder_name, unsigned int info = mailbox_stat_t::DEFAULT);
 
     /**
+    Query only UIDNEXT for a mailbox using a lightweight STATUS.
+
+    Sends: STATUS "mailbox" (UIDNEXT) and returns the numeric UIDNEXT value.
+
+    @param mailbox     Mailbox name.
+    @return            UIDNEXT value for the mailbox.
+    @throw imap_error  Parsing failure or server error.
+    */
+    unsigned long status_uidnext(const std::string& mailbox);
+ 
+    /**
     Removing a message from the given mailbox.
 
     @param mailbox    Mailbox to use.

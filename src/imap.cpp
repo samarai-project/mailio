@@ -209,6 +209,7 @@ imap::imap(const string& hostname, unsigned port, milliseconds timeout) :
             boost::asio::ssl::verify_none
         };
     dlg_->connect();
+    debug_bugfix("imap class constructed");
 }
 
 
@@ -223,6 +224,7 @@ imap::~imap()
     catch (...)
     {
     }
+    debug_bugfix("imap class destructed");
 }
 
 
@@ -781,6 +783,84 @@ auto imap::statistics(const list<string>& folder_name, unsigned int info) -> mai
     string delim = folder_delimiter();
     string folder_name_s = folder_tree_to_string(folder_name, delim);
     return statistics(folder_name_s, info);
+}
+
+
+unsigned long imap::status_uidnext(const string& mailbox)
+{
+    // Issue the light-weight STATUS for UIDNEXT only.
+    string cmd = "STATUS " + to_astring(mailbox) + " (uidnext)";
+    dlg_->send(format(cmd));
+
+    unsigned long uidnext = 0;
+    bool has_more = true;
+    try
+    {
+        while (has_more)
+        {
+            reset_response_parser();
+            string line = dlg_->receive();
+            tag_result_response_t parsed_line = parse_tag_result(line);
+
+            if (parsed_line.tag == UNTAGGED_RESPONSE)
+            {
+                parse_response(parsed_line.response);
+                if (mandatory_part_.empty() || mandatory_part_.front()->token_type != response_token_t::token_type_t::ATOM ||
+                    !iequals(mandatory_part_.front()->atom, "STATUS"))
+                    throw imap_error("Expecting the status atom.", "Line=`" + line + "`.");
+                mandatory_part_.pop_front();
+
+                // Expect: STATUS <mailbox> (UIDNEXT <num> ...)
+                // Find the first list token and scan for UIDNEXT
+                for (auto it = mandatory_part_.begin(); it != mandatory_part_.end(); ++it)
+                {
+                    if ((*it)->token_type == response_token_t::token_type_t::LIST && (*it)->parenthesized_list.size() >= 2)
+                    {
+                        bool have_key = false;
+                        string key;
+                        for (const auto &elem : (*it)->parenthesized_list)
+                        {
+                            const string &val = elem->atom;
+                            if (!have_key)
+                            {
+                                key = val;
+                                have_key = true;
+                            }
+                            else
+                            {
+                                if (iequals(key, "UIDNEXT"))
+                                {
+                                    uidnext = stoul(val);
+                                    // Continue processing until tagged OK is received
+                                }
+                                have_key = false;
+                            }
+                        }
+                    }
+                }
+            }
+            else if (parsed_line.tag == to_string(tag_))
+            {
+                if (parsed_line.result.has_value() && parsed_line.result.value() == tag_result_response_t::OK)
+                    has_more = false;
+                else
+                    throw imap_error("STATUS UIDNEXT failure.", "Line=`" + line + "`.");
+            }
+            else
+                throw imap_error("Parsing failure.", "Tag=`" + parsed_line.tag + "`.");
+        }
+    }
+    catch (const invalid_argument& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+    catch (const out_of_range& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+
+    reset_response_parser();
+    return uidnext;
 }
 
 
@@ -1375,14 +1455,16 @@ void imap::auth_login(const string& username, const string& password)
 
 void imap::auth_login_xoauth2(const std::string &username, const std::string &access_token)
 {
-    
+debug_bugfix("auth_login_xoauth2 1");
     // XOAUTH2 SASL initial client response as per RFC 7628 (and Google docs):
     // base64("user=" user "\x01auth=Bearer " access_token "\x01\x01")
     std::string sasl = "user=" + username + "\x01" + "auth=Bearer " + access_token + "\x01\x01";
     std::string sasl_b64 = b64_encode(sasl);
     // IMAP requires a tagged command: AUTHENTICATE XOAUTH2 <base64>
     // (Unlike SMTP which may negotiate with numeric codes.)
+debug_bugfix("auth_login_xoauth2 2");
     dlg_->send(format("AUTHENTICATE XOAUTH2 " + sasl_b64));
+debug_bugfix("auth_login_xoauth2 3");
 
     // We expect one of:
     // 1. Immediate tagged OK => success.
@@ -1569,15 +1651,40 @@ void imap::idle(const std::function<bool(const idle_event_t&)>& on_event,
                 const std::atomic_bool& cancel,
                 std::optional<std::chrono::milliseconds> io_timeout_override)
 {
-    // Optionally override I/O timeout for the duration of IDLE
-    std::optional<std::chrono::milliseconds> prev_timeout;
-    if (io_timeout_override.has_value())
-    {
-        prev_timeout = dlg_->timeout();
-        dlg_->set_timeout(*io_timeout_override);
-    }
+    // Compute adaptive per-op timeout ("tick") for IDLE so the loop wakes periodically
+    // without requiring the caller to manage a second timeout. Always restore the
+    // previous dialog timeout on exit, even on exceptions.
+    const auto prev_timeout = dlg_->timeout();
+    struct TimeoutRestorer {
+        std::shared_ptr<dialog> dlg;
+        std::chrono::milliseconds prev;
+        ~TimeoutRestorer(){ if (dlg) dlg->set_timeout(prev); }
+    } timeout_restorer{dlg_, prev_timeout};
+
+    // Derive a base tick. Priority:
+    // 1) If caller provided io_timeout_override, honor it as the heartbeat.
+    // 2) Else, derive from max_idle (wake roughly every 1/10 of it), clamped to [1s, 30s].
+    // 3) If max_idle is zero (infinite), fall back to prev_timeout if non-zero, otherwise 5s.
+    auto derive_base_tick = [&]() -> milliseconds {
+        if (io_timeout_override.has_value())
+            return *io_timeout_override;
+        if (max_idle.count() > 0)
+        {
+            auto tenth = max_idle / 10;
+            if (tenth.count() <= 0) tenth = milliseconds(1);
+            auto clamped = std::max(milliseconds(1000), std::min(tenth, milliseconds(30000)));
+            return clamped;
+        }
+        // max_idle == 0: infinite IDLE requested; prefer existing timeout if set, else 5s.
+        if (prev_timeout.count() > 0)
+            return std::min(prev_timeout, milliseconds(30000));
+        return milliseconds(5000);
+    };
+    const milliseconds base_tick = derive_base_tick();
+
     // Send IDLE and wait for continuation response ('+ ...').
     dlg_->send(format("IDLE"));
+    
     // Expect a continuation line starting with '+'; servers may include text after it.
     {
         string line = dlg_->receive();
@@ -1589,6 +1696,30 @@ void imap::idle(const std::function<bool(const idle_event_t&)>& on_event,
     is_idling_.store(true, std::memory_order_release);
     auto start_tp = steady_clock::now();
     bool keep_running = true;
+    
+    // Ensure is_idling_ flag is cleared on any exit path.
+    struct IdleFlagRestorer { std::atomic<bool>& f; ~IdleFlagRestorer(){ f.store(false, std::memory_order_release); } } _idle_flag{is_idling_};
+    
+    // Helper to finish IDLE cleanly; swallow errors during cleanup.
+    auto finish_idle = [&]() {
+        if (planned_disconnect_.load(std::memory_order_acquire))
+            return; // Skip DONE on planned disconnect
+        try
+        {
+            // For DONE completion, don't wait unbounded. Use a small bounded timeout.
+            milliseconds completion_to = std::min<milliseconds>(base_tick, milliseconds(5000));
+            if (completion_to.count() <= 0) completion_to = milliseconds(2000);
+            dlg_->set_timeout(completion_to);
+            dlg_->send("DONE");
+            string line = dlg_->receive();
+            (void)parse_tag_result(line);
+        }
+        catch (...)
+        {
+            // Best-effort cleanup only.
+        }
+    };
+    
     try
     {
         while (keep_running)
@@ -1602,8 +1733,42 @@ void imap::idle(const std::function<bool(const idle_event_t&)>& on_event,
                     break;
             }
 
+            // Adapt per-op timeout to the remaining time or to a periodic heartbeat.
+            if (max_idle.count() > 0)
+            {
+                auto elapsed = duration_cast<milliseconds>(steady_clock::now() - start_tp);
+                milliseconds remaining = (elapsed >= max_idle) ? milliseconds(0) : (max_idle - elapsed);
+                // For the next receive, use the smaller of base_tick and remaining (but at least 1ms).
+                milliseconds next_tick = base_tick;
+                if (remaining.count() > 0)
+                    next_tick = std::max<milliseconds>(milliseconds(1), std::min(base_tick, remaining));
+                dlg_->set_timeout(next_tick);
+            }
+            else
+            {
+                dlg_->set_timeout(base_tick);
+            }
+
             reset_response_parser();
-            string line = dlg_->receive();
+            string line;
+            try
+            {
+                line = dlg_->receive();
+            }
+            catch (const dialog_planned_disconnect&)
+            {
+                // Planned shutdown unblocks receive; exit IDLE without further protocol I/O.
+                return;
+            }
+            catch (const dialog_error& de)
+            {
+                // Treat receive timeout during IDLE as a heartbeat tick; continue loop.
+                if (std::string(de.what()) == std::string("Network receiving timed out."))
+                    continue;
+                // Other network errors: best-effort finish and rethrow.
+                finish_idle();
+                throw;
+            }
             tag_result_response_t parsed_line = parse_tag_result(line);
 
             if (parsed_line.tag == UNTAGGED_RESPONSE)
@@ -1679,57 +1844,29 @@ void imap::idle(const std::function<bool(const idle_event_t&)>& on_event,
     }
     catch (const invalid_argument& exc)
     {
-        if (!planned_disconnect_.load(std::memory_order_acquire))
-        {
-            // Terminate IDLE with DONE before surfacing error
-            dlg_->send("DONE");
-            // Consume the tagged completion line
-            string line = dlg_->receive();
-            (void)parse_tag_result(line);
-        }
-        is_idling_.store(false, std::memory_order_release);
+        finish_idle();
         throw imap_error("Parsing failure.", exc.what());
     }
     catch (const out_of_range& exc)
     {
-        if (!planned_disconnect_.load(std::memory_order_acquire))
-        {
-            dlg_->send("DONE");
-            string line = dlg_->receive();
-            (void)parse_tag_result(line);
-        }
-        is_idling_.store(false, std::memory_order_release);
+        finish_idle();
         throw imap_error("Parsing failure.", exc.what());
     }
     catch (...)
     {
-        if (!planned_disconnect_.load(std::memory_order_acquire)) {
-            is_idling_.store(false, std::memory_order_release);
-            throw;
-        }
-        is_idling_.store(false, std::memory_order_release);
-        return;
+        // Best-effort finish unless planned disconnect; then just exit.
+        if (!planned_disconnect_.load(std::memory_order_acquire))
+            finish_idle();
+        throw;
     }
 
     // Exit IDLE cleanly
     if (!planned_disconnect_.load(std::memory_order_acquire))
     {
-        dlg_->send("DONE");
-        // Expect a tagged OK for the IDLE command we started earlier.
-        {
-            string line = dlg_->receive();
-            tag_result_response_t parsed = parse_tag_result(line);
-            if (parsed.tag != to_string(tag_) || !parsed.result.has_value() || parsed.result.value() != tag_result_response_t::OK) {
-                is_idling_.store(false, std::memory_order_release);
-                throw imap_error("IDLE completion failure.", "Response=`" + parsed.response + "`.");
-            }
-        }
+        finish_idle();
     }
     reset_response_parser();
-    // Restore previous timeout if we overrode it
-    if (prev_timeout.has_value())
-        dlg_->set_timeout(*prev_timeout);
-    is_idling_.store(false, std::memory_order_release);
+    // Timeout restored automatically by TimeoutRestorer
 }
 
 void imap::disconnect(std::chrono::milliseconds timeout)

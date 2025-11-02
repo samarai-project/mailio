@@ -18,19 +18,34 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <chrono>
 #include <memory>
 #include <atomic>
+#include <iostream>
+#include <functional>
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/streambuf.hpp>
 #include <boost/asio/deadline_timer.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
-#include "export.hpp"
-
 
 namespace mailio
 {
-    
-inline void debug_bugfix(const std::string& text) {
-    std::cout << "MAILIO [BUGFIX] " << text << "\n";
+
+// Type of a user-provided log callback. Receives the formatted message text.
+using log_callback_t = std::function<void(const std::string&)>;
+
+/**
+Install or replace a global log callback used by mailio internal logging.
+
+Passing an empty/null callback clears the installed callback and restores
+the default behavior (log to std::cout with a simple prefix).
+*/
+void set_log_callback(log_callback_t cb);
+
+// Internal helper implemented in dialog.cpp; do not use directly.
+void call_log_callback_or_fallback(const std::string& text);
+
+inline void debug_bugfix(const std::string& text)
+{
+    call_log_callback_or_fallback(text);
 }
 
 std::string b64_encode(const std::string& value);
@@ -63,7 +78,7 @@ public:
     /**
     Closing the connection.
     **/
-    virtual ~dialog() = default;
+    virtual ~dialog();
 
     dialog(dialog&&) = delete;
 

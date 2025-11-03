@@ -219,6 +219,23 @@ public:
     void operator=(imap&&) = delete;
 
     /**
+    Set a human-friendly name for this IMAP session.
+
+    The name is forwarded to the underlying network dialog so that
+    debug logs get prefixed with the session label. Useful when running
+    multiple concurrent sessions and diagnosing traffic.
+
+    Example: set_session_name("acc1");
+    Results in log lines like: [acc1] SEND: <cmd>
+
+    @param name  Arbitrary identifier; empty clears the name.
+    */
+    void set_session_name(const std::string& name);
+
+    /** Get the current IMAP session name (possibly empty). */
+    std::string session_name() const;
+
+    /**
     Authenticating with the given credentials.
 
     The method should be called only once on an existing object - it is not possible to authenticate again within the same connection.
@@ -268,13 +285,16 @@ public:
     @param message_no  Number of the message to fetch.
     @param msg         Message to store the result.
     @param is_uid      Using a message uid number instead of a message sequence number.
-    @param header_only Flag if only the message header should be fetched.
+    @param header_only    Flag if only the message header should be fetched.
+    @param dont_set_seen  If true, fetches the message using PEEK semantics so the \\Seen flag is not set on the server. The returned octets are
+                          byte-for-byte identical to the RFC822 variant (RFC822 == BODY[]; RFC822.HEADER == BODY.PEEK[HEADER]).
     @throw imap_error  Fetching message failure.
     @throw imap_error  Parsing failure.
     @throw *           `fetch(const list<messages_range_t>&, map<unsigned long, message>&, bool, bool, codec::line_len_policy_t)`.
     @todo              Add server error messages to exceptions.
     **/
-    void fetch(const std::string& mailbox, unsigned long message_no, bool is_uid, message& msg, bool header_only = false);
+    void fetch(const std::string& mailbox, unsigned long message_no, bool is_uid, message& msg, bool header_only = false,
+               bool dont_set_seen = false);
 
     /**
     Fetching a message from an already selected mailbox.
@@ -287,11 +307,13 @@ public:
     @param message_no  Number of the message to fetch.
     @param msg         Message to store the result.
     @param is_uid      Using a message uid number instead of a message sequence number.
-    @param header_only Flag if only the message header should be fetched.
+    @param header_only    Flag if only the message header should be fetched.
+    @param dont_set_seen  If true, use PEEK semantics to avoid setting \\Seen while preserving the exact returned bytes.
     @throw *           `fetch(const list<messages_range_t>&, map<unsigned long, message>&, bool, bool, codec::line_len_policy_t)`.
     @todo              Add server error messages to exceptions.
     **/
-    void fetch(unsigned long message_no, message& msg, bool is_uid = false, bool header_only = false);
+    void fetch(unsigned long message_no, message& msg, bool is_uid = false, bool header_only = false,
+               bool dont_set_seen = false);
 
     /**
     Fetching messages from an already selected mailbox.
@@ -307,6 +329,7 @@ public:
     @param is_uids        Using message UID numbers instead of a message sequence numbers.
     @param header_only    Flag if only the message headers should be fetched.
     @param line_policy    Decoder line policy to use while parsing each message.
+    @param dont_set_seen  If true, use BODY.PEEK to avoid setting the \\Seen flag on the server; octets are identical to RFC822/HEADER variants.
     @throw imap_error     Fetching message failure.
     @throw imap_error     Parsing failure.
     @throw *              `parse_tag_result(const string&)`, `parse_response(const string&)`,
@@ -314,7 +337,8 @@ public:
     @todo                 Add server error messages to exceptions.
     **/
     void fetch(const std::list<messages_range_t>& messages_range, std::map<unsigned long, message>& found_messages, bool is_uids = false,
-        bool header_only = false, codec::line_len_policy_t line_policy = codec::line_len_policy_t::RECOMMENDED);
+        bool header_only = false, codec::line_len_policy_t line_policy = codec::line_len_policy_t::RECOMMENDED,
+        bool dont_set_seen = false);
 
     /**
     Appending a message to the given folder.

@@ -209,7 +209,6 @@ imap::imap(const string& hostname, unsigned port, milliseconds timeout) :
             boost::asio::ssl::verify_none
         };
     dlg_->connect();
-    debug_bugfix("imap class constructed");
 }
 
 
@@ -224,7 +223,6 @@ imap::~imap()
     catch (...)
     {
     }
-    debug_bugfix("imap class destructed");
 }
 
 
@@ -242,6 +240,20 @@ string imap::authenticate(const string& username, const string& password, auth_m
     else if (method == auth_method_t::XOAUTH2)
         auth_login_xoauth2(username, password);
     return greeting;
+}
+
+void imap::set_session_name(const std::string& name)
+{
+    // Store on the underlying dialog so low-level SEND/RECEIVE logs carry the label.
+    if (dlg_)
+        dlg_->set_session_name(name);
+}
+
+std::string imap::session_name() const
+{
+    if (dlg_)
+        return dlg_->session_name();
+    return std::string();
 }
 
 
@@ -359,19 +371,20 @@ auto imap::select(const string& mailbox, bool read_only) -> mailbox_stat_t
 }
 
 
-void imap::fetch(const string& mailbox, unsigned long message_no, bool is_uid, message& msg, bool header_only)
+void imap::fetch(const string& mailbox, unsigned long message_no, bool is_uid, message& msg, bool header_only,
+                 bool dont_set_seen)
 {
     select(mailbox);
-    fetch(message_no, msg, is_uid, header_only);
+    fetch(message_no, msg, is_uid, header_only, dont_set_seen);
 }
 
-
-void imap::fetch(unsigned long message_no, message& msg, bool is_uid, bool header_only)
+void imap::fetch(unsigned long message_no, message& msg, bool is_uid, bool header_only,
+                 bool dont_set_seen)
 {
     list<messages_range_t> messages_range;
     messages_range.push_back(imap::messages_range_t(message_no, message_no));
     map<unsigned long, message> found_messages;
-    fetch(messages_range, found_messages, is_uid, header_only, msg.line_policy());
+    fetch(messages_range, found_messages, is_uid, header_only, msg.line_policy(), dont_set_seen);
     if (!found_messages.empty())
         msg = std::move(found_messages.begin()->second);
 }
@@ -388,19 +401,23 @@ The fetch untagged responses provide messages. In the last tagged response the s
 format.
 */
 void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long, message>& found_messages, bool is_uids, bool header_only,
-    codec::line_len_policy_t line_policy)
+    codec::line_len_policy_t line_policy, bool dont_set_seen)
 {
     if (messages_range.empty())
         throw imap_error("Empty messages range.", "");
 
+    // Choose token that preserves raw bytes but avoids setting \\Seen when requested.
+    // RFC822 and BODY[] return identical octets for the full message; HEADER variants align similarly.
     const string RFC822_TOKEN = string("RFC822") + (header_only ? ".HEADER" : "");
+    const string BODY_TOKEN = string("BODY") + (header_only ? ".PEEK[HEADER]" : ".PEEK[]");
+    const string FETCH_TOKEN = dont_set_seen ? BODY_TOKEN : RFC822_TOKEN;
     const string message_ids = messages_range_list_to_string(messages_range);
 
     string cmd;
     if (is_uids)
         cmd.append("UID ");
-    // cmd.append("FETCH " + message_ids + TOKEN_SEPARATOR_STR + RFC822_TOKEN);
-    cmd.append("FETCH " + message_ids + TOKEN_SEPARATOR_STR + "(" + string("UID ") + RFC822_TOKEN + ")");
+    // Request UID along with the chosen body token to preserve behavior and avoid marking seen when requested.
+    cmd.append("FETCH " + message_ids + TOKEN_SEPARATOR_STR + "(" + string("UID ") + FETCH_TOKEN + ")");
     dlg_->send(format(cmd));
 
     // stores [msg_str, uid_no, sequence_no, hash] indexed by sequence_no or uid_no
@@ -421,16 +438,24 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
             {
                 parse_response(parsed_line.response);
 
-                if (mandatory_part_.front()->token_type != response_token_t::token_type_t::ATOM)
-                    throw imap_error("Number expected when fetching a message.", "Response=`" + parsed_line.response + ".`");
+                // Tolerate unrelated untagged responses (e.g., EXISTS/RECENT/EXPUNGE/OK CAPABILITY).
+                if (mandatory_part_.empty() || mandatory_part_.front()->token_type != response_token_t::token_type_t::ATOM)
+                    continue;
 
-                unsigned long sequence_no = stoul(mandatory_part_.front()->atom);
+                unsigned long sequence_no = 0;
+                try {
+                    sequence_no = stoul(mandatory_part_.front()->atom);
+                } catch (...) {
+                    // Not a numeric leading atom -> unsolicited untagged; skip.
+                    continue;
+                }
                 mandatory_part_.pop_front();
                 if (sequence_no == 0)
-                    throw imap_error("Zero sequence number when fetching a message.", "");
+                    continue; // invalid seq, ignore rather than fail
 
-                if (!iequals(mandatory_part_.front()->atom, "FETCH"))
-                    throw imap_error("Expecting the fetch atom.", "Response=`" + parsed_line.response + ".`");
+                if (mandatory_part_.empty() || mandatory_part_.front()->token_type != response_token_t::token_type_t::ATOM ||
+                    !iequals(mandatory_part_.front()->atom, "FETCH"))
+                    continue; // unsolicited untagged, not a FETCH line
 
                 unsigned long uid_no = 0;
                 shared_ptr<response_token_t> literal_token = nullptr;
@@ -441,6 +466,7 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                     {
                         fetch_list_token = part;
                         for (auto token = part->parenthesized_list.begin(); token != part->parenthesized_list.end(); token++)
+                        {
                             if ((*token)->token_type == response_token_t::token_type_t::ATOM)
                             {
                                 if (iequals((*token)->atom, "UID"))
@@ -450,7 +476,12 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                                         throw imap_error("No uid number when fetching a message.", "");
                                     uid_no = stoul((*token)->atom);
                                 }
-                                else if (iequals((*token)->atom, RFC822_TOKEN))
+                                else if (iequals((*token)->atom, RFC822_TOKEN)
+                                         || iequals((*token)->atom, "BODY[]")
+                                         || iequals((*token)->atom, "BODY.PEEK[]")
+                                         || iequals((*token)->atom, "RFC822.HEADER")
+                                         || iequals((*token)->atom, "BODY[HEADER]")
+                                         || iequals((*token)->atom, "BODY.PEEK[HEADER]"))
                                 {
                                     token++;
                                     if (token == part->parenthesized_list.end() || (*token)->token_type != response_token_t::token_type_t::LITERAL)
@@ -459,6 +490,12 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                                     // Do not break here; keep scanning existing tokens for UID as well.
                                 }
                             }
+                            else if ((*token)->token_type == response_token_t::token_type_t::LITERAL && literal_token == nullptr)
+                            {
+                                // Be permissive: when only UID and BODY were requested, the first literal in the FETCH data is the message payload.
+                                literal_token = *token;
+                            }
+                        }
                     }
 
                 if (literal_token != nullptr)
@@ -549,7 +586,7 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                         raw.swap(normalized);
                     }
                     
-                    // Add the messageto the msg map
+                    // Add the message to the msg map
                     msg_str.emplace(
                         is_uids ? uid_no : sequence_no,
                         make_tuple(
@@ -618,13 +655,7 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                     throw imap_error("Fetching message failure.", "Response=`" + parsed_line.response + "`.");
             }
             else
-            {
-                // Ignore unrelated tagged responses (e.g., completion of an earlier command like NOOP)
-                // and continue waiting for our current tag. This can legitimately occur when the server
-                // delivers status lines interleaved with our FETCH untagged responses.
-                reset_response_parser();
-                continue;
-            }
+                throw imap_error("Invalid tag when fetching a message.", "Parsed tag=`" + parsed_line.tag + "`.");
         }
     }
     catch (const invalid_argument& exc)
@@ -1971,26 +2002,29 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
                     {
                         // BYE or client requested stop; exit IDLE.
                         is_idling_.store(false, std::memory_order_release);
-                        // Attempt to gracefully terminate IDLE if still active.
-                        try { dlg_->send("DONE"); } catch (const dialog_error &dex) { if (!is_timeout_error(dex)) throw; }
-                        // Drain until tagged completion or until deadline to keep state sane.
-                        while (true)
+
+                        // If this is a normal stop (not BYE), send DONE and drain until either
+                        // the tagged completion arrives or a single receive timeout occurs.
+                        if (res.value() != idle_result_t::BYE)
                         {
-                            try
+                            try { dlg_->send("DONE"); } catch (const dialog_error &dex) { if (!is_timeout_error(dex)) throw; }
+                            // Drain best-effort until we see our tag or receive times out once.
+                            while (true)
                             {
-                                auto l2 = dlg_->receive();
-                                auto pl2 = parse_tag_result(l2);
-                                if (pl2.tag == to_string(tag_)) break;
-                                if (pl2.tag == UNTAGGED_RESPONSE) { (void)parse_and_emit(l2, pl2); }
-                            }
-                            catch (const dialog_error &dex)
-                            {
-                                if (is_timeout_error(dex))
+                                try
                                 {
-                                    if (steady_clock::now() >= deadline) break;
-                                    continue;
+                                    auto l2 = dlg_->receive();
+                                    auto pl2 = parse_tag_result(l2);
+                                    if (pl2.tag == to_string(tag_)) break;
+                                    if (pl2.tag == UNTAGGED_RESPONSE) { (void)parse_and_emit(l2, pl2); }
+                                    // Ignore unrelated tags here.
                                 }
-                                throw;
+                                catch (const dialog_error &dex)
+                                {
+                                    if (is_timeout_error(dex))
+                                        break; // one timeout -> assume drained sufficiently
+                                    throw;
+                                }
                             }
                         }
                         return res.value();
@@ -2025,26 +2059,38 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
             break;
     }
 
-    // If still idling, send DONE and wait for tagged completion best-effort.
+    // If still idling, terminate depending on reason: normal expiry vs cancel/disconnect.
     if (is_idling_.exchange(false, std::memory_order_acq_rel))
     {
-        try { dlg_->send("DONE"); } catch (const dialog_error &ex) { if (!is_timeout_error(ex)) throw; }
-        // Drain until our tag completes or until a short grace window.
-        auto grace_deadline = steady_clock::now() + std::chrono::seconds(2);
-        while (steady_clock::now() < grace_deadline)
+        const bool cancelled = cancel.load(std::memory_order_acquire) || planned_disconnect_.load(std::memory_order_acquire);
+        if (cancelled)
         {
-            try
+            // Courtesy DONE: use a very short send-timeout and do not wait for a reply.
+            auto prev_to = dlg_->timeout();
+            dlg_->set_timeout(std::chrono::milliseconds(100));
+            try { dlg_->send("DONE"); } catch (...) { /* ignore */ }
+            dlg_->set_timeout(prev_to);
+        }
+        else
+        {
+            // Normal idle expiry: send DONE and drain until tagged completion or a single timeout.
+            try { dlg_->send("DONE"); } catch (const dialog_error &ex) { if (!is_timeout_error(ex)) throw; }
+            while (true)
             {
-                auto line = dlg_->receive();
-                auto pl = parse_tag_result(line);
-                if (pl.tag == to_string(tag_)) break;
-                if (pl.tag == UNTAGGED_RESPONSE) { (void)parse_and_emit(line, pl); }
-            }
-            catch (const dialog_error &ex)
-            {
-                if (is_timeout_error(ex))
-                    break; // no more data within grace; stop waiting
-                throw;
+                try
+                {
+                    auto line = dlg_->receive();
+                    auto pl = parse_tag_result(line);
+                    if (pl.tag == to_string(tag_)) break;
+                    if (pl.tag == UNTAGGED_RESPONSE) { (void)parse_and_emit(line, pl); }
+                    // Ignore unrelated tagged lines.
+                }
+                catch (const dialog_error &ex)
+                {
+                    if (is_timeout_error(ex))
+                        break; // one timeout -> done draining
+                    throw;
+                }
             }
         }
     }

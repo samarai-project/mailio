@@ -57,13 +57,15 @@ inline void debug_bugfix(const std::string& text, size_t max)
     }
 }
 
-inline void debug_bugfix(const std::string& prefix, const std::string& text, size_t max)
+inline void debug_bugfix(const std::string &session_name,
+                         const std::string &prefix, 
+                         const std::string &text, 
+                         size_t max = 128)
 {
-    if (text.size() > max) {
-        debug_bugfix(prefix + ": " + text.substr(0, max) + "...");
-    } else {
-        debug_bugfix(prefix + ": " + text);
-    }
+    if (text.size() > max)
+        debug_bugfix("<" + session_name + "> " + prefix + ": " + text.substr(0, max) + "...");
+    else
+        debug_bugfix("<" + session_name + "> " + prefix + ": " + text);
 }
 
 std::string b64_encode(const std::string& value);
@@ -148,6 +150,25 @@ public:
 
     /** Get the current I/O timeout. */
     std::chrono::milliseconds timeout() const { return timeout_; }
+
+    /**
+    Assign a human-friendly session name to this dialog instance.
+
+    The session name, when set to a non-empty string, is automatically
+    prefixed to debug log lines emitted by this dialog, e.g.:
+        [MyIMAP] SEND: <command>
+        [MyIMAP] RECEIVE: <line>
+
+    The default is an empty name which results in legacy log formatting
+    without the bracketed prefix. This call is thread-safe with respect to
+    logging, but callers should still coordinate with other state changes.
+
+    @param name  Arbitrary identifier for the session; empty clears it.
+    */
+    void set_session_name(const std::string& name) { session_name_ = name; }
+
+    /** Get the currently assigned session name (possibly empty). */
+    std::string session_name() const { return session_name_; }
 
     /**
     Abort any in-flight or future I/O immediately and close the socket.
@@ -359,6 +380,12 @@ protected:
     to fail fast with a distinct error instead of generic network errors.
     */
     std::atomic<bool> aborted_{false};
+
+    /**
+    Optional label used to prefix debug log lines for this dialog instance.
+    When empty, no session prefix is added to logs.
+    */
+    std::string session_name_;
 
 #ifdef MAILIO_TEST_HOOKS
     simulated_error_t sim_error_ = simulated_error_t::NONE;

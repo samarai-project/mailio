@@ -97,7 +97,8 @@ dialog::dialog(const string& hostname, unsigned port, milliseconds timeout) : st
 
 dialog::dialog(const dialog& other) : std::enable_shared_from_this<dialog>(),
     hostname_(move(other.hostname_)), port_(other.port_), ios_(other.ios_), socket_(other.socket_), timer_(other.timer_),
-    timeout_(other.timeout_), timer_expired_(other.timer_expired_.load()), strmbuf_(other.strmbuf_), istrm_(other.istrm_)
+    timeout_(other.timeout_), timer_expired_(other.timer_expired_.load()), strmbuf_(other.strmbuf_), istrm_(other.istrm_),
+    closed_(other.closed_), aborted_(other.aborted_.load()), session_name_(other.session_name_)
 {
 }
  
@@ -119,10 +120,9 @@ void dialog::connect()
     }
 }
 
-
-void dialog::send(const string& line)
+void dialog::send(const string &line)
 {
-    debug_bugfix("SEND", line, 256);
+    debug_bugfix(session_name_, "SEND", line);
     if (aborted_.load(std::memory_order_acquire))
         throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
 #ifdef MAILIO_TEST_HOOKS
@@ -135,12 +135,20 @@ void dialog::send(const string& line)
             throw dialog_error("Network sending timed out.", "Simulated timeout");
     }
 #endif
-    if (timeout_.count() == 0)
-        send_sync(*socket_, line);
-    else
-        send_async(*socket_, line);
+    try
+    {
+        if (timeout_.count() == 0)
+            send_sync(*socket_, line);
+        else
+            send_async(*socket_, line);
+    }
+    catch (...)
+    {
+        if (aborted_.load(std::memory_order_acquire))
+            throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
+        throw;
+    }
 }
-
 
 // TODO: perhaps the implementation should be common with `receive_raw()`
 string dialog::receive(bool raw)
@@ -157,13 +165,22 @@ string dialog::receive(bool raw)
             throw dialog_error("Network receiving timed out.", "Simulated timeout");
     }
 #endif
-    string res{};
-    if (timeout_.count() == 0)
-        res = receive_sync(*socket_, raw);
-    else
-        res = receive_async(*socket_, raw);
-    debug_bugfix("RECEIVE", res, 256);
-    return res;
+    try
+    {
+        string res{};
+        if (timeout_.count() == 0)
+            res = receive_sync(*socket_, raw);
+        else
+            res = receive_async(*socket_, raw);
+        debug_bugfix(session_name_, "RECEIVE", res);
+        return res;
+    }
+    catch (...)
+    {
+        if (aborted_.load(std::memory_order_acquire))
+            throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
+        throw;
+    }
 }
 
 string dialog::receive_bytes(std::size_t total_bytes, std::size_t chunk_size)
@@ -180,10 +197,22 @@ string dialog::receive_bytes(std::size_t total_bytes, std::size_t chunk_size)
             throw dialog_error("Network receiving timed out.", "Simulated timeout");
     }
 #endif
-    if (timeout_.count() == 0)
-        return receive_exact_sync(*socket_, total_bytes);
-    else
-        return receive_exact_async(*socket_, total_bytes, chunk_size);
+    try
+    {
+        string res{};
+        if (timeout_.count() == 0)
+            res =  receive_exact_sync(*socket_, total_bytes);
+        else
+            res =  receive_exact_async(*socket_, total_bytes, chunk_size);
+        debug_bugfix(session_name_, "RECEIVE", "[bin:" + std::to_string(res.size()) + "]");
+        return res;
+    }
+    catch (...)
+    {
+        if (aborted_.load(std::memory_order_acquire))
+            throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
+        throw;
+    }
 }
 
 void dialog::close() noexcept
@@ -294,52 +323,88 @@ void dialog::connect_async()
     wait_async(st->done, st->error, "Network connecting timed out.", "Network connecting failed.", st->ec);
 }
 
-
-template<typename Socket>
-void dialog::send_async(Socket& socket, string line)
+template <typename Socket>
+void dialog::send_async(Socket &socket, string line)
 {
-    check_timeout();
-    // Keep the write buffer alive for the lifetime of the async operation.
-    auto buf = std::make_shared<string>(move(line));
-    buf->append("\r\n");
-    struct op_state { bool done{false}; bool error{false}; error_code ec; };
-    auto st = std::make_shared<op_state>();
-    auto self = this->shared_from_this();
-    async_write(socket, buffer(*buf),
-        [st, buf, self](const error_code& error, size_t)
+    try
+    {
+        check_timeout();
+        // Keep the write buffer alive for the lifetime of the async operation.
+        auto buf = std::make_shared<string>(move(line));
+        buf->append("\r\n");
+        struct op_state
         {
-            st->done  = !error;
-            st->error = !!error;
-            st->ec    = error;
-        });
-    wait_async(st->done, st->error, "Network sending timed out.", "Network sending failed.", st->ec);
+            bool done{false};
+            bool error{false};
+            error_code ec;
+        };
+        auto st = std::make_shared<op_state>();
+        auto self = this->shared_from_this();
+        async_write(socket, buffer(*buf),
+                    [st, buf, self](const error_code &error, size_t)
+                    {
+                        st->done = !error;
+                        st->error = !!error;
+                        st->ec = error;
+                    });
+        wait_async(st->done, st->error, "Network sending timed out.", "Network sending failed.", st->ec);
+    }
+    catch (const dialog_error) {
+        throw;
+    }
+    catch (const system_error &exc)
+    {
+        throw dialog_error("Network sending error.", exc.code().message());
+    }
+    catch (const std::exception &exc)
+    {
+        throw dialog_error("Network sending error.", exc.what());
+    }
 }
 
-
-template<typename Socket>
-string dialog::receive_async(Socket& socket, bool raw)
+template <typename Socket>
+string dialog::receive_async(Socket &socket, bool raw)
 {
-    check_timeout();
-    struct op_state { bool done{false}; bool error{false}; error_code ec; };
-    auto st = std::make_shared<op_state>();
-    auto self = this->shared_from_this();
-    async_read_until(socket, *strmbuf_, "\n",
-        [st, self](const error_code& error, size_t)
+    try
+    {
+        check_timeout();
+        struct op_state
         {
-            if (!error)
-                st->done = true;
-            else
-                st->error = true;
-            st->ec = error;
-        });
-    wait_async(st->done, st->error, "Network receiving timed out.", "Network receiving failed.", st->ec);
-    string line;
-    getline(*istrm_, line, '\n');
-    if (!raw)
-        trim_if(line, is_any_of("\r\n"));
-    return line;
+            bool done{false};
+            bool error{false};
+            error_code ec;
+        };
+        auto st = std::make_shared<op_state>();
+        auto self = this->shared_from_this();
+        async_read_until(socket, *strmbuf_, "\n",
+                         [st, self](const error_code &error, size_t)
+                         {
+                             if (!error)
+                                 st->done = true;
+                             else
+                                 st->error = true;
+                             st->ec = error;
+                         });
+        wait_async(st->done, st->error, "Network receiving timed out.", "Network receiving failed.", st->ec);
+        string line;
+        getline(*istrm_, line, '\n');
+        if (!raw)
+            trim_if(line, is_any_of("\r\n"));
+        return line;
+    }
+    catch (const dialog_error)
+    {
+        throw;
+    }
+    catch (const system_error &exc)
+    {
+        throw dialog_error("Network receiving error.", exc.code().message());
+    }
+    catch (const std::exception &exc)
+    {
+        throw dialog_error("Network receiving error.", exc.what());
+    }
 }
-
 
 template<typename Socket>
 string dialog::receive_exact_sync(Socket& socket, std::size_t total_bytes)
@@ -496,26 +561,30 @@ dialog_ssl::dialog_ssl(const dialog& other, const ssl_options_t& options) : dial
     }
 }
 
-
-void dialog_ssl::send(const string& line)
+void dialog_ssl::send(const string &line)
 {
-    
-    debug_bugfix("SEND", line, 256);
-    
     if (aborted_.load(std::memory_order_acquire))
-        throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
+    throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
+    debug_bugfix(session_name_, "SEND", line);
     if (!ssl_)
     {
         dialog::send(line);
         return;
     }
-
-    if (timeout_.count() == 0)
-        send_sync(*ssl_socket_, line);
-    else
-        send_async(*ssl_socket_, line);
+    try
+    {
+        if (timeout_.count() == 0)
+            send_sync(*ssl_socket_, line);
+        else
+            send_async(*ssl_socket_, line);
+    }
+    catch (...)
+    {
+        if (aborted_.load(std::memory_order_acquire))
+            throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
+        throw;
+    }
 }
-
 
 string dialog_ssl::receive(bool raw)
 {
@@ -523,7 +592,6 @@ string dialog_ssl::receive(bool raw)
         throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
     if (!ssl_)
         return dialog::receive(raw);
-
     try
     {
         string res{};
@@ -531,15 +599,16 @@ string dialog_ssl::receive(bool raw)
             res = receive_sync(*ssl_socket_, raw);
         else
             res = receive_async(*ssl_socket_, raw);
-        debug_bugfix("RECEIVE", res, 256);
+        debug_bugfix(session_name_, "RECEIVE", res);
         return res;
     }
-    catch (const system_error& exc)
+    catch (...)
     {
-        throw dialog_error("Network receiving error.", exc.code().message());
+        if (aborted_.load(std::memory_order_acquire))
+            throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
+        throw;
     }
 }
-
 
 string dialog_ssl::receive_bytes(std::size_t total_bytes, std::size_t chunk_size)
 {
@@ -547,20 +616,23 @@ string dialog_ssl::receive_bytes(std::size_t total_bytes, std::size_t chunk_size
         throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
     if (!ssl_)
         return dialog::receive_bytes(total_bytes, chunk_size);
-
     try
     {
+        string res{};
         if (timeout_.count() == 0)
-            return receive_exact_sync(*ssl_socket_, total_bytes);
+            res = receive_exact_sync(*ssl_socket_, total_bytes);
         else
-            return receive_exact_async(*ssl_socket_, total_bytes, chunk_size);
+            res = receive_exact_async(*ssl_socket_, total_bytes, chunk_size);
+        debug_bugfix(session_name_, "RECEIVE", "[bin:" + std::to_string(res.size()) + "]");
+        return res;
     }
     catch (const system_error& exc)
     {
-        throw dialog_error("Network receiving error.", exc.code().message());
+        if (aborted_.load(std::memory_order_acquire))
+            throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
+        throw dialog_error("Network byte receiving error.", exc.code().message());
     }
 }
-
 
 shared_ptr<dialog_ssl> dialog_ssl::to_ssl(const shared_ptr<dialog> dlg, const dialog_ssl::ssl_options_t& options)
 {

@@ -1801,6 +1801,9 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
                                std::chrono::milliseconds timeout,
                                const std::atomic_bool &cancel)
 {
+    
+    debug_bugfix("imap::idle IN");
+    
     // Independent, long-lived IDLE loop per RFC 2177.
     // Contract:
     // - Do not rely on dialog timeout to end the loop; instead, use a deadline and
@@ -1816,15 +1819,15 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
 
     const auto deadline = steady_clock::now() + timeout;
 
-    // Ensure we can periodically wake to check cancel/deadline even if caller set dialog timeout to 0.
-    // Temporarily set a conservative poll timeout if needed, then restore.
+    // Ensure we can periodically wake to check cancel/deadline even if caller set dialog timeout to
+    // 0. Temporarily set a conservative poll timeout if needed, then restore.
     const auto orig_net_to = dlg_->timeout();
-    const bool temporarily_adjusted = (orig_net_to.count() == 0);
-    if (temporarily_adjusted)
+    if (orig_net_to.count() == 0)
         dlg_->set_timeout(std::chrono::seconds(10));
 
     struct restore_timeout_t {
-        std::shared_ptr<dialog> d; milliseconds orig;
+        std::shared_ptr<dialog> d; 
+        milliseconds orig;
         ~restore_timeout_t(){ if (d) d->set_timeout(orig); }
     } _restore{dlg_, orig_net_to};
 
@@ -2057,6 +2060,7 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
         // If we left the inner loop because of time/cancel, exit; otherwise re-IDLE.
         if (steady_clock::now() >= deadline || cancel.load(std::memory_order_acquire))
             break;
+            
     }
 
     // If still idling, terminate depending on reason: normal expiry vs cancel/disconnect.
@@ -2065,6 +2069,7 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
         const bool cancelled = cancel.load(std::memory_order_acquire) || planned_disconnect_.load(std::memory_order_acquire);
         if (cancelled)
         {
+            debug_bugfix("Sending DONE after cancel");
             // Courtesy DONE: use a very short send-timeout and do not wait for a reply.
             auto prev_to = dlg_->timeout();
             dlg_->set_timeout(std::chrono::milliseconds(100));
@@ -2074,21 +2079,37 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
         else
         {
             // Normal idle expiry: send DONE and drain until tagged completion or a single timeout.
-            try { dlg_->send("DONE"); } catch (const dialog_error &ex) { if (!is_timeout_error(ex)) throw; }
-            while (true)
+            debug_bugfix("Sending DONE");
+            try
+            {
+                dlg_->send("DONE");
+            }
+            catch (const dialog_error &ex)
+            {
+                if (!is_timeout_error(ex))
+                    throw;
+            }
+            while (true) // need a loop in case we get unsolicited untagged responses
             {
                 try
                 {
                     auto line = dlg_->receive();
                     auto pl = parse_tag_result(line);
-                    if (pl.tag == to_string(tag_)) break;
-                    if (pl.tag == UNTAGGED_RESPONSE) { (void)parse_and_emit(line, pl); }
+                    if (pl.tag == to_string(tag_))
+                        break;
+                    if (pl.tag == UNTAGGED_RESPONSE)
+                    {
+                        (void)parse_and_emit(line, pl);
+                    }
                     // Ignore unrelated tagged lines.
                 }
                 catch (const dialog_error &ex)
                 {
                     if (is_timeout_error(ex))
+                    {
+                        debug_bugfix("Idle() timeout after DONE");
                         break; // one timeout -> done draining
+                    }
                     throw;
                 }
             }
@@ -2100,14 +2121,12 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
 
 void imap::disconnect(std::chrono::milliseconds timeout)
 {
-    
+    debug_bugfix("imap::disconnect IN");
     // If already planning a disconnect, do nothing.
     if (planned_disconnect_.exchange(true, std::memory_order_acq_rel))
         return;
- 
     // In all cases, abort I/O immediately to guarantee quick exit of any blocked operations.
     try { dlg_->abort_now(); } catch (...) { /* ignore */ }
-    
 }
 
 void imap::noop()

@@ -1951,6 +1951,12 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
                 }
                 // Ignore unrelated lines
             }
+            catch (const dialog_planned_disconnect&)
+            {
+                // Planned disconnect before we actually entered idling state.
+                // No DONE required here; propagate to caller so higher-level code is aware.
+                throw;
+            }
             catch (const dialog_error &ex)
             {
                 if (is_timeout_error(ex))
@@ -2046,6 +2052,12 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
                     // Already idling; ignore spurious continuation
                 }
             }
+            catch (const dialog_planned_disconnect&)
+            {
+                // Planned disconnect during active idling: exit loops and let the common
+                // cleanup path below send DONE using the existing, fully featured sequence.
+                break; // break inner loop
+            }
             catch (const dialog_error &ex)
             {
                 if (is_timeout_error(ex))
@@ -2058,18 +2070,17 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
         }
 
         // If we left the inner loop because of time/cancel, exit; otherwise re-IDLE.
-        if (steady_clock::now() >= deadline || cancel.load(std::memory_order_acquire))
+        if (steady_clock::now() >= deadline || cancel.load(std::memory_order_acquire) || planned_disconnect_.load(std::memory_order_acquire))
             break;
-            
     }
 
     // If still idling, terminate depending on reason: normal expiry vs cancel/disconnect.
     if (is_idling_.exchange(false, std::memory_order_acq_rel))
     {
+        // Route planned disconnect through the full DONE sequence when it occurred during active idling.
         const bool cancelled = cancel.load(std::memory_order_acquire) || planned_disconnect_.load(std::memory_order_acquire);
         if (cancelled)
         {
-            debug_bugfix("Sending DONE after cancel");
             // Courtesy DONE: use a very short send-timeout and do not wait for a reply.
             auto prev_to = dlg_->timeout();
             dlg_->set_timeout(std::chrono::milliseconds(100));
@@ -2079,7 +2090,6 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
         else
         {
             // Normal idle expiry: send DONE and drain until tagged completion or a single timeout.
-            debug_bugfix("Sending DONE");
             try
             {
                 dlg_->send("DONE");
@@ -2107,7 +2117,6 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
                 {
                     if (is_timeout_error(ex))
                     {
-                        debug_bugfix("Idle() timeout after DONE");
                         break; // one timeout -> done draining
                     }
                     throw;
@@ -2115,6 +2124,11 @@ imap::idle_result_t imap::idle(const std::function<bool(const idle_event_t &)> &
             }
         }
     }
+
+    // If a planned stop initiated this unwind, signal it to the caller as an exception now that
+    // the normal DONE sequence has been executed.
+    if (planned_disconnect_.load(std::memory_order_acquire))
+        throw dialog_planned_disconnect("Planned disconnect.", "IDLE ended by planned disconnect.");
 
     return idle_result_t::EXPIRED;
 }
@@ -2125,8 +2139,15 @@ void imap::disconnect(std::chrono::milliseconds timeout)
     // If already planning a disconnect, do nothing.
     if (planned_disconnect_.exchange(true, std::memory_order_acq_rel))
         return;
-    // In all cases, abort I/O immediately to guarantee quick exit of any blocked operations.
-    try { dlg_->abort_now(); } catch (...) { /* ignore */ }
+    // Request a graceful planned interrupt; underlying idle loop will catch dialog_planned_disconnect.
+    try { dlg_->request_planned_interrupt(); } catch (...) { }
+    // Optionally wait a short grace period for idle loop to unwind (non-blocking if not idling).
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (dlg_->is_in_wait() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    // If still in wait after grace, perform hard abort.
+    if (dlg_->is_in_wait())
+        try { dlg_->abort_now(); } catch (...) { }
 }
 
 void imap::noop()

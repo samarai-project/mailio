@@ -13,11 +13,14 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 
 #include <string>
 #include <algorithm>
+#include <cstdlib>
+#include <cstdio>
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <mailio/dialog.hpp>
 #include <mailio/base64.hpp>
 #include <mutex>
+#include <openssl/ssl.h>
 
 
 using std::string;
@@ -242,6 +245,21 @@ void dialog::close() noexcept
     {
         // Never throw from cleanup.
     }
+}
+
+void dialog::request_planned_interrupt()
+{
+    planned_interrupt_.store(true, std::memory_order_release);
+    // If currently waiting, poke the socket so wait loop wakes promptly.
+    if (in_wait_async_.load(std::memory_order_acquire) && socket_)
+    {
+        boost::system::error_code ec;
+        socket_->cancel(ec);
+    }
+}
+
+bool dialog::is_in_wait() const { 
+    return in_wait_async_.load(std::memory_order_acquire); 
 }
 
 void dialog::abort_now() noexcept
@@ -491,21 +509,55 @@ string dialog::receive_exact_async(Socket& socket, std::size_t total_bytes, std:
 
 void dialog::wait_async(const bool& has_op, const bool& op_error, const char* expired_msg, const char* op_msg, const error_code& error)
 {
-    do
+    in_wait_async_.store(true, std::memory_order_release);
+    bool observed_timeout = false;
+    for (;;)
     {
-        if (timer_expired_.load(std::memory_order_acquire))
-            throw dialog_error(expired_msg, error.message());
-        if (op_error)
-            throw dialog_error(op_msg, error.message());
         ios_->run_one();
+        if (has_op || op_error)
+            break;
+        // Planned graceful interrupt takes precedence; cancel outstanding op to force handler.
+        if (planned_interrupt_.load(std::memory_order_acquire))
+        {
+            if (socket_)
+            {
+                boost::system::error_code ec_ignore; socket_->cancel(ec_ignore);
+            }
+            continue; // loop until handler runs
+        }
+        if (timer_expired_.load(std::memory_order_acquire))
+        {
+            observed_timeout = true;
+            if (socket_)
+            {
+                boost::system::error_code ec_ignore; socket_->cancel(ec_ignore);
+            }
+            continue;
+        }
     }
-    while (!has_op);
-    // Cancel any pending timer to avoid stray callbacks after the operation completed.
     if (timer_ && timer_armed_.load())
     {
         try { timer_->cancel(); } catch (...) {}
         timer_armed_.store(false, std::memory_order_release);
     }
+    // Outcome
+    if (op_error)
+    {
+        if (planned_interrupt_.load(std::memory_order_acquire))
+        {
+            planned_interrupt_.store(false, std::memory_order_release);
+            in_wait_async_.store(false, std::memory_order_release);
+            throw dialog_planned_disconnect("Operation aborted.", "Planned disconnect");
+        }
+        if (observed_timeout || timer_expired_.load(std::memory_order_acquire))
+        {
+            in_wait_async_.store(false, std::memory_order_release);
+            throw dialog_error(expired_msg, error.message());
+        }
+        in_wait_async_.store(false, std::memory_order_release);
+        throw dialog_error(op_msg, error.message());
+    }
+    in_wait_async_.store(false, std::memory_order_release);
 }
 
 
@@ -542,12 +594,20 @@ dialog_ssl::dialog_ssl(const string& hostname, unsigned port, milliseconds timeo
     dialog(hostname, port, timeout), ssl_(false), context_(make_shared<context>(options.method)),
     ssl_socket_(make_shared<boost::asio::ssl::stream<tcp::socket&>>(*socket_, *context_))
 {
+#ifdef DANGEROUSELY_LOG_SSL_KEYS
+    // if enabled, log ssl keys, this can be used to analyze ssl traffic with wireshark
+    setup_keylog_callback();
+#endif
 }
 
 
 dialog_ssl::dialog_ssl(const dialog& other, const ssl_options_t& options) : dialog(other), context_(make_shared<context>(options.method)),
     ssl_socket_(make_shared<boost::asio::ssl::stream<tcp::socket&>>(*socket_, *context_))
 {
+#ifdef DANGEROUSELY_LOG_SSL_KEYS
+    // if enabled, log ssl keys, this can be used to analyze ssl traffic with wireshark
+    setup_keylog_callback();
+#endif
     try
     {
         ssl_socket_->set_verify_mode(options.verify_mode);
@@ -661,5 +721,37 @@ void dialog::set_simulated_error(simulated_error_t err, int count)
     sim_error_count_ = count;
 }
 #endif
+
+void dialog_ssl::setup_keylog_callback()
+{
+#if defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10101000L
+    // OpenSSL 1.1.1+ supports SSL_CTX_set_keylog_callback for TLS 1.3 and earlier
+    const char* keylog_file = std::getenv("SSLKEYLOGFILE");
+    //const char *keylog_file = std::getenv("SSLKEYLOGFILE");
+    if (keylog_file && keylog_file[0] != '\0')
+    {
+        // Get the native OpenSSL SSL_CTX* from Boost.Asio context
+        SSL_CTX *native_ctx = context_->native_handle();
+        if (native_ctx)
+        {
+            SSL_CTX_set_keylog_callback(native_ctx, [](const SSL * /*ssl*/, const char *line)
+            {
+                const char* keylog_file = std::getenv("SSLKEYLOGFILE");
+                if (!keylog_file || keylog_file[0] == '\0') {
+                    return;
+                }
+                // Append the key line to the file (format: "CLIENT_RANDOM <hex> <hex>")
+                // Thread-safe on most platforms for small writes with append mode
+                FILE* f = fopen(keylog_file, "a");
+                if (f)
+                {
+                    fprintf(f, "%s\n", line);
+                    fclose(f);
+                } 
+            });
+        }
+    }
+#endif
+}
 
 } // namespace mailio

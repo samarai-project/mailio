@@ -189,6 +189,12 @@ public:
     */
     void close() noexcept;
 
+    /** Request a graceful planned interrupt of any in-flight async operation. */
+    void request_planned_interrupt();
+
+    /** Query whether wait_async is currently active (best-effort). */
+    bool is_in_wait() const;
+
 #ifdef MAILIO_TEST_HOOKS
 
     /**
@@ -382,6 +388,19 @@ protected:
     std::atomic<bool> aborted_{false};
 
     /**
+    Flag indicating a graceful planned interrupt was requested. Unlike `aborted_` it does
+    not immediately close the socket; it asks the current async operation to unwind and
+    throw `dialog_planned_disconnect`, giving higher layers (e.g. IMAP idle loop) a chance
+    to perform protocol-level shutdown (DONE/LOGOUT) before transport closure.
+    */
+    std::atomic<bool> planned_interrupt_{false};
+
+    /**
+    True while inside `wait_async()` pumping handlers for an outstanding network operation.
+    */
+    std::atomic<bool> in_wait_async_{false};
+
+    /**
     Optional label used to prefix debug log lines for this dialog instance.
     When empty, no session prefix is added to logs.
     */
@@ -504,6 +523,12 @@ protected:
     SSL socket (when used).
     **/
     std::shared_ptr<boost::asio::ssl::stream<boost::asio::ip::tcp::socket&>> ssl_socket_;
+
+    /**
+    Setup OpenSSL keylog callback if SSLKEYLOGFILE environment variable is set.
+    This can be used in Wireshark to decrypt TLS traffic.
+    **/
+    void setup_keylog_callback();
 };
 
 

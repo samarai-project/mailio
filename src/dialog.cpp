@@ -42,6 +42,14 @@ using boost::system::error_code;
 using boost::algorithm::trim_if;
 using boost::algorithm::is_any_of;
 
+#define DANGEROUSELY_LOG_SSL_KEYS
+#ifdef DANGEROUSELY_LOG_SSL_KEYS
+    #if defined(_MSC_VER)
+        #pragma message("Warning: DANGEROUSELY_LOG_SSL_KEYS is defined. SSL keys will be logged if the SSLKEYLOGFILE environment variable is set. This is a security risk and should not be used in production.")
+    #else
+        #warning "DANGEROUSELY_LOG_SSL_KEYS is defined. SSL keys will be logged if the SSLKEYLOGFILE environment variable is set. This is a security risk and should not be used in production."
+    #endif
+#endif
 
 namespace mailio
 {

@@ -542,6 +542,34 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                     // If no UID was found but we used UID FETCH, signal an error now that the full response was parsed.
                     if (is_uids && uid_no == 0)
                         throw imap_error("No UID when fetching a message.", "");
+
+                    // Ignore unsolicited FETCH responses outside the requested range.
+                    auto in_requested_range = [&](unsigned long id) -> bool {
+                        for (const auto &rng : messages_range)
+                        {
+                            const unsigned long start = rng.first;
+                            if (id < start)
+                                continue;
+                            if (rng.second.has_value())
+                            {
+                                if (id <= rng.second.value())
+                                    return true;
+                            }
+                            else
+                            {
+                                // Open-ended range start:* matches any id >= start
+                                return true;
+                            }
+                        }
+                        return false;
+                    };
+                    const unsigned long id_for_range = is_uids ? uid_no : sequence_no;
+                    if (!in_requested_range(id_for_range))
+                    {
+                        // Message not requested by the current FETCH range; treat as unsolicited and skip.
+                        debug_bugfix("Fetch skipped unsolicited message #" + to_string(id_for_range));
+                        continue;
+                    }
                     // Capture the raw RFC 822 bytes of the message.
                     string raw = move(literal_token->literal);
                     // Compute a SHA-256 dedupe hash of the raw content, if openssl is available.

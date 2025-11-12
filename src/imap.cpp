@@ -411,7 +411,36 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
     const string RFC822_TOKEN = string("RFC822") + (header_only ? ".HEADER" : "");
     const string BODY_TOKEN = string("BODY") + (header_only ? ".PEEK[HEADER]" : ".PEEK[]");
     const string FETCH_TOKEN = dont_set_seen ? BODY_TOKEN : RFC822_TOKEN;
-    const string message_ids = messages_range_list_to_string(messages_range);
+    
+    // Prefer explicit ID list when callers provided only singleton ranges (e.g., a single message).
+    // This avoids needlessly sending start:end syntax like "120:120" and improves interoperability
+    // with servers that behave poorly with range forms for singletons.
+    bool all_singletons = true;
+    for (const auto &rng : messages_range)
+    {
+        if (!rng.second.has_value() || rng.second.value() != rng.first)
+        {
+            all_singletons = false;
+            break;
+        }
+    }
+
+    string message_ids;
+    if (all_singletons)
+    {
+        // Build a comma-separated list of explicit IDs (no range syntax).
+        bool first = true;
+        for (const auto &rng : messages_range)
+        {
+            if (!first) message_ids += LIST_SEPARATOR; else first = false;
+            message_ids += to_string(rng.first);
+        }
+    }
+    else
+    {
+        // Fall back to the standard range formatter, including open-ended ranges if any.
+        message_ids = messages_range_list_to_string(messages_range);
+    }
 
     string cmd;
     if (is_uids)
@@ -422,9 +451,62 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
 
     // stores [msg_str, uid_no, sequence_no, hash] indexed by sequence_no or uid_no
     map<unsigned long, tuple<string, unsigned long, unsigned long, string>> msg_str;
+
+    // Helper to parse and move all collected raw messages into found_messages.
+    auto finalize_collected = [&]() {
+        for (const auto &ms : msg_str)
+        {
+            message msg;
+            try
+            {
+                msg.strict_mode(strict_mode_);
+                msg.strict_codec_mode(strict_codec_mode_);
+                msg.uid(std::get<1>(ms.second));
+                msg.sequence_no(std::get<2>(ms.second));
+                msg.dedupe_hash(std::get<3>(ms.second));
+                msg.line_policy(line_policy);
+                msg.parse(std::get<0>(ms.second));
+            }
+            catch (const dialog_error &ex)
+            {
+                if (!strict_mode_)
+                {
+                    msg.error_state(true);
+                    msg.error(std::string("Error pasing message: ") + ex.what() + "\nDetails: " + ex.details());
+                }
+                else
+                    throw;
+            }
+            catch (const mime_error &ex)
+            {
+                if (!strict_mode_)
+                {
+                    msg.error_state(true);
+                    msg.error(std::string("Error pasing message: ") + ex.what() + "\nDetails: " + ex.details());
+                }
+                else
+                    throw;
+            }
+            catch (const std::exception &ex)
+            {
+                if (!strict_mode_)
+                {
+                    msg.error_state(true);
+                    msg.error(std::string("Error pasing message: ") + ex.what());
+                }
+                else
+                    throw;
+            }
+            found_messages.emplace(ms.first, move(msg));
+        }
+    };
     
     // Flag whether the response line is the last one i.e. the tagged response.
     bool has_more = true;
+    // Determine if the caller asked for exactly one message id (seq or uid), not a range/open-ended.
+    const bool is_single_fetch = (messages_range.size() == 1) &&
+        (messages_range.front().second.has_value()) &&
+        (messages_range.front().first == messages_range.front().second.value());
     try
     {
         while (has_more)
@@ -633,51 +715,15 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                 if (parsed_line.result.value() == tag_result_response_t::OK)
                 {
                     has_more = false;
-                    for (const auto &ms : msg_str)
-                    {
-                        message msg;
-                        try
-                        {
-                            msg.strict_mode(strict_mode_);
-                            msg.strict_codec_mode(strict_codec_mode_);
-                            msg.uid(std::get<1>(ms.second));
-                            msg.sequence_no(std::get<2>(ms.second));
-                            msg.dedupe_hash(std::get<3>(ms.second));
-                            msg.line_policy(line_policy);
-                            msg.parse(std::get<0>(ms.second));
-                        }
-                        catch (const dialog_error &ex)
-                        {
-                            if (!strict_mode_)
-                            {
-                                msg.error_state(true);
-                                msg.error(std::string("Error pasing message: ") + ex.what() + "\nDetails: " + ex.details());
-                            }
-                            else
-                                throw;
-                        }
-                        catch (const mime_error &ex)
-                        {
-                            if (!strict_mode_)
-                            {
-                                msg.error_state(true);
-                                msg.error(std::string("Error pasing message: ") + ex.what() + "\nDetails: " + ex.details());
-                            }
-                            else
-                                throw;                            
-                        }
-                        catch (const std::exception &ex)
-                        {
-                            if (!strict_mode_)
-                            {
-                                msg.error_state(true);
-                                msg.error(std::string("Error pasing message: ") + ex.what());
-                            }
-                            else
-                                throw;
-                        }
-                        found_messages.emplace(ms.first, move(msg));
-                    }
+                    finalize_collected();
+                }
+                else if (parsed_line.result.value() == tag_result_response_t::NO)
+                {
+                    // Some servers respond with NO when any requested messages in a range no longer
+                    // exist (e.g., UID FETCH 53498:*). In that case, return whatever messages we
+                    // collected and do not throw. 
+                    has_more = false;
+                    finalize_collected();
                 }
                 else
                     throw imap_error("Fetching message failure.", "Response=`" + parsed_line.response + "`.");

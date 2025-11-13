@@ -1,5 +1,7 @@
 # vcpkg && cmake
 build/
+build_arm64/
+build_x86_64/
 vcpkg_installed/
 
 # macOS

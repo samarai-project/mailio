@@ -2,9 +2,9 @@
 set -euo pipefail
 
 echo "[mailio] Configuring (macOS arm64)…"
-rm -rf build
+rm -rf build_arm64
 
-cmake -S . -B build \
+cmake -S . -B build_arm64 \
   -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_SHARED_LIBS=OFF \
@@ -15,6 +15,6 @@ cmake -S . -B build \
   -DMAILIO_TEST_HOOKS=ON
 
 echo "[mailio] Building (Release)…"
-cmake --build build --config Release --parallel
+cmake --build build_arm64 --config Release --parallel
 
 echo "[mailio] Done."

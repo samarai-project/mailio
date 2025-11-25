@@ -113,6 +113,39 @@ public:
     struct mailbox_folder_t
     {
         std::map<std::string, mailbox_folder_t> folders;
+        bool selectable = true;
+        std::vector<std::string> attributes;
+    };
+
+    /**
+    High-level classification of folders for client discovery.
+    */
+    enum class mailbox_folder_type_t
+    {
+        REGULAR,
+        INBOX,
+        SENT,
+        DRAFTS,
+        TRASH,
+        JUNK,
+        ARCHIVE,
+        FLAGGED,
+        ALL,
+        IMPORTANT
+    };
+
+    /**
+    Flat folder descriptor returned by `list_folders_high_level`.
+    */
+    struct mailbox_high_level_t
+    {
+        std::string path;                /**< IMAP mailbox identifier to use with SELECT. */
+        std::string name;                /**< User-facing folder name (leaf in the hierarchy). */
+        mailbox_folder_type_t type;      /**< Classification derived from SPECIAL-USE/INBOX rules. */
+        bool is_virtual = false;         /**< True for virtual/aggregate folders (All Mail, Flagged, Important). */
+        bool can_add = false;            /**< True if messages can be appended or moved into the folder. */
+        bool is_custom = false;          /**< True if folder is user-created (i.e. not well-known). */
+        bool can_delete = false;         /**< True if folder can be deleted. */
     };
 
     /**
@@ -664,6 +697,18 @@ public:
     */
     using folders_interest_list_t = std::vector<std::pair<std::string, bool>>;
     folders_interest_list_t list_folders_interest();
+
+    /**
+    Flat high-level folder listing suitable for folder discovery in clients.
+
+    Collects existing folder metadata, folds in SPECIAL-USE information, skips non-selectable
+    nodes and applies heuristics for capability flags (virtual/canAdd/canDelete/custom).
+
+    @return Ordered list of folder descriptors (leaf order from LIST traversal).
+    @throw * `list_special_use_by_attr()`, `list_folders(const string&)`, `folder_delimiter()`.
+    */
+    using high_level_folders_list_t = std::vector<mailbox_high_level_t>;
+    high_level_folders_list_t list_folders_high_level();
 
     /**
     Deleting a folder.

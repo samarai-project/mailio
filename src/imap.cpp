@@ -1267,26 +1267,67 @@ auto imap::list_folders(const string& folder_name) -> mailbox_folder_t
                 if (!iequals(token->atom, "LIST"))
                     throw imap_error("Expecting the list atom.", "Atom=`" + token->atom + "`.");
 
-                if (mandatory_part_.size() < 3)
+                if (mandatory_part_.size() < 2)
                     throw imap_error("Listing folders failure.", "");
-                auto found_folder = mandatory_part_.begin();
-                found_folder++; found_folder++;
-                if (found_folder != mandatory_part_.end() && (*found_folder)->token_type == response_token_t::token_type_t::ATOM)
+
+                shared_ptr<response_token_t> attr_tokens;
+                shared_ptr<response_token_t> mailbox_token;
+                for (const auto& tok : mandatory_part_)
                 {
-                    vector<string> folders_hierarchy;
-                    // TODO: May `delim` contain more than one character?
-                    split(folders_hierarchy, (*found_folder)->atom, is_any_of(delim));
-                    map<string, mailbox_folder_t>* mbox = &mailboxes.folders;
-                    for (auto f : folders_hierarchy)
+                    if (!attr_tokens && tok->token_type == response_token_t::token_type_t::LIST)
+                        attr_tokens = tok;
+                    if (tok->token_type == response_token_t::token_type_t::ATOM ||
+                        tok->token_type == response_token_t::token_type_t::LITERAL)
+                        mailbox_token = tok;
+                }
+
+                if (!mailbox_token)
+                    throw imap_error("Parsing failure.", "Line=`" + line + "`.");
+
+                string folder_full_name = mailbox_token->token_type == response_token_t::token_type_t::ATOM
+                                              ? mailbox_token->atom
+                                              : mailbox_token->literal;
+
+                bool selectable = true;
+                vector<string> attributes;
+                if (attr_tokens)
+                {
+                    for (const auto& attr_tok : attr_tokens->parenthesized_list)
                     {
-                        auto fit = find_if(mbox->begin(), mbox->end(), [&f](const std::pair<string, mailbox_folder_t>& mf){ return mf.first == f; });
-                        if (fit == mbox->end())
-                            mbox->insert(std::make_pair(f, mailbox_folder_t{}));
-                        mbox = &(mbox->at(f).folders);
+                        if (attr_tok->token_type != response_token_t::token_type_t::ATOM)
+                            continue;
+                        string attr = attr_tok->atom;
+                        attributes.push_back(attr);
+                        if (iequals(attr, "\\Noselect") || iequals(attr, "\\NonExistent"))
+                            selectable = false;
                     }
                 }
+
+                if (folder_full_name.empty())
+                    continue;
+
+                vector<string> folders_hierarchy;
+                if (delim.empty())
+                    folders_hierarchy.push_back(folder_full_name);
                 else
-                    throw imap_error("Parsing failure.", "Line=`" + line + "`.");
+                    split(folders_hierarchy, folder_full_name, is_any_of(delim));
+
+                map<string, mailbox_folder_t>* mbox = &mailboxes.folders;
+                mailbox_folder_t* node = nullptr;
+                for (const auto& f : folders_hierarchy)
+                {
+                    auto fit = find_if(mbox->begin(), mbox->end(), [&f](const std::pair<string, mailbox_folder_t>& mf){ return mf.first == f; });
+                    if (fit == mbox->end())
+                        fit = mbox->insert(std::make_pair(f, mailbox_folder_t{})).first;
+                    node = &(fit->second);
+                    mbox = &(node->folders);
+                }
+
+                if (node)
+                {
+                    node->selectable = selectable;
+                    node->attributes = attributes;
+                }
             }
             else if (parsed_line.tag == to_string(tag_))
             {
@@ -1507,16 +1548,17 @@ auto imap::list_folders_interest() -> folders_interest_list_t
     // Flatten the tree to full paths
     string delim = folder_delimiter();
     vector<string> all_folders;
-    std::function<void(const mailbox_folder_t&, const string&)> walk = [&](const mailbox_folder_t& node, const string& prefix)
+    auto walk = [&](const auto& self, const mailbox_folder_t& node, const string& prefix) -> void
     {
         for (const auto& kv : node.folders)
         {
             string name = prefix.empty() ? kv.first : (prefix + delim + kv.first);
-            all_folders.push_back(name);
-            walk(kv.second, name);
+            if (kv.second.selectable)
+                all_folders.push_back(name);
+            self(self, kv.second, name);
         }
     };
-    walk(tree, "");
+    walk(walk, tree, "");
 
     // 3) Build inverse map mailbox->special-uses from special (attr->mailbox)
     map<string, vector<string>> mailbox_attrs;
@@ -1576,6 +1618,113 @@ auto imap::list_folders_interest() -> folders_interest_list_t
         out.emplace_back(mbox, interesting);
     }
 
+    return out;
+}
+
+auto imap::list_folders_high_level() -> high_level_folders_list_t
+{
+    high_level_folders_list_t out;
+
+    auto special = list_special_use_by_attr();
+    map<string, vector<string>> special_by_mailbox;
+    for (const auto& kv : special)
+        special_by_mailbox[kv.second].push_back(kv.first);
+
+    mailbox_folder_t tree = list_folders("");
+    string delim = folder_delimiter();
+
+    auto join_path = [&](const string& prefix, const string& leaf) -> string
+    {
+        if (prefix.empty())
+            return leaf;
+        if (delim.empty())
+            return prefix + leaf;
+        return prefix + delim + leaf;
+    };
+
+    auto has_attr = [](const vector<string>& attrs, const string& target) -> bool
+    {
+        for (const auto& attr : attrs)
+            if (iequals(attr, target))
+                return true;
+        return false;
+    };
+
+    auto attr_to_type = [](const string& attr) -> std::optional<mailbox_folder_type_t>
+    {
+        if (iequals(attr, "\\Inbox"))
+            return mailbox_folder_type_t::INBOX;
+        if (iequals(attr, "\\Sent"))
+            return mailbox_folder_type_t::SENT;
+        if (iequals(attr, "\\Drafts"))
+            return mailbox_folder_type_t::DRAFTS;
+        if (iequals(attr, "\\Trash"))
+            return mailbox_folder_type_t::TRASH;
+        if (iequals(attr, "\\Junk") || iequals(attr, "\\Spam"))
+            return mailbox_folder_type_t::JUNK;
+        if (iequals(attr, "\\Archive"))
+            return mailbox_folder_type_t::ARCHIVE;
+        if (iequals(attr, "\\Flagged"))
+            return mailbox_folder_type_t::FLAGGED;
+        if (iequals(attr, "\\All") || iequals(attr, "\\AllMail"))
+            return mailbox_folder_type_t::ALL;
+        if (iequals(attr, "\\Important"))
+            return mailbox_folder_type_t::IMPORTANT;
+        return std::nullopt;
+    };
+
+    auto determine_type = [&](const vector<string>& attrs, const string& path) -> mailbox_folder_type_t
+    {
+        for (const auto& attr : attrs)
+        {
+            auto mapped = attr_to_type(attr);
+            if (mapped.has_value())
+                return mapped.value();
+        }
+        if (iequals(path, "INBOX"))
+            return mailbox_folder_type_t::INBOX;
+        return mailbox_folder_type_t::REGULAR;
+    };
+
+    auto walk = [&](const auto& self, const mailbox_folder_t& node, const string& prefix) -> void
+    {
+        for (const auto& kv : node.folders)
+        {
+            const auto& folder = kv.second;
+            string path = join_path(prefix, kv.first);
+
+            vector<string> attrs = folder.attributes;
+            auto special_it = special_by_mailbox.find(path);
+            if (special_it != special_by_mailbox.end())
+                attrs.insert(attrs.end(), special_it->second.begin(), special_it->second.end());
+
+            if (folder.selectable)
+            {
+                auto type = determine_type(attrs, path);
+                bool is_virtual = (type == mailbox_folder_type_t::ALL ||
+                                   type == mailbox_folder_type_t::FLAGGED ||
+                                   type == mailbox_folder_type_t::IMPORTANT);
+                bool can_add = folder.selectable && !is_virtual && !has_attr(attrs, "\\Noinferiors");
+                bool can_delete = folder.selectable && type == mailbox_folder_type_t::REGULAR;
+                bool is_custom = (type == mailbox_folder_type_t::REGULAR) && !iequals(path, "INBOX");
+
+                mailbox_high_level_t entry;
+                entry.path = path;
+                entry.name = kv.first;
+                entry.type = type;
+                entry.is_virtual = is_virtual;
+                entry.can_add = can_add;
+                entry.is_custom = is_custom;
+                entry.can_delete = can_delete;
+
+                out.push_back(std::move(entry));
+            }
+
+            self(self, folder, path);
+        }
+    };
+
+    walk(walk, tree, "");
     return out;
 }
 

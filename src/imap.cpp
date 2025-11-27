@@ -445,12 +445,12 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
     string cmd;
     if (is_uids)
         cmd.append("UID ");
-    // Request UID along with the chosen body token to preserve behavior and avoid marking seen when requested.
-    cmd.append("FETCH " + message_ids + TOKEN_SEPARATOR_STR + "(" + string("UID ") + FETCH_TOKEN + ")");
+    // Request UID/FLAGS along with the chosen body token to preserve behavior and avoid marking seen when requested.
+    cmd.append("FETCH " + message_ids + TOKEN_SEPARATOR_STR + "(UID FLAGS " + FETCH_TOKEN + ")");
     dlg_->send(format(cmd));
 
-    // stores [msg_str, uid_no, sequence_no, hash] indexed by sequence_no or uid_no
-    map<unsigned long, tuple<string, unsigned long, unsigned long, string>> msg_str;
+    // stores [msg_str, uid_no, sequence_no, hash, flags] indexed by sequence_no or uid_no
+    map<unsigned long, tuple<string, unsigned long, unsigned long, string, vector<string>>> msg_str;
 
     // Helper to parse and move all collected raw messages into found_messages.
     auto finalize_collected = [&]() {
@@ -464,6 +464,7 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                 msg.uid(std::get<1>(ms.second));
                 msg.sequence_no(std::get<2>(ms.second));
                 msg.dedupe_hash(std::get<3>(ms.second));
+                msg.flags(std::get<4>(ms.second));
                 msg.line_policy(line_policy);
                 msg.parse(std::get<0>(ms.second));
             }
@@ -540,9 +541,56 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                     continue; // unsolicited untagged, not a FETCH line
 
                 unsigned long uid_no = 0;
+                vector<string> message_flags;
                 shared_ptr<response_token_t> literal_token = nullptr;
                 // Keep a reference to the FETCH data list to allow rescanning after reading a literal
                 shared_ptr<response_token_t> fetch_list_token = nullptr;
+                auto parse_fetch_metadata = [&]() {
+                    if (fetch_list_token == nullptr)
+                        return;
+                    message_flags.clear();
+                    for (auto token = fetch_list_token->parenthesized_list.begin(); token != fetch_list_token->parenthesized_list.end(); ++token)
+                    {
+                        const auto& current = *token;
+                        if (current->token_type != response_token_t::token_type_t::ATOM)
+                            continue;
+
+                        if (iequals(current->atom, "UID"))
+                        {
+                            auto next = token;
+                            ++next;
+                            if (next == fetch_list_token->parenthesized_list.end() ||
+                                (*next)->token_type != response_token_t::token_type_t::ATOM)
+                                throw imap_error("No uid number when fetching a message.", "");
+                            uid_no = stoul((*next)->atom);
+                        }
+                        else if (iequals(current->atom, "FLAGS"))
+                        {
+                            auto next = token;
+                            ++next;
+                            if (next == fetch_list_token->parenthesized_list.end())
+                                continue;
+                            const auto& flags_token = *next;
+                            auto add_flag = [&](const shared_ptr<response_token_t>& flag_token) {
+                                if (flag_token != nullptr &&
+                                    flag_token->token_type == response_token_t::token_type_t::ATOM &&
+                                    !flag_token->atom.empty())
+                                {
+                                    message_flags.push_back(flag_token->atom);
+                                }
+                            };
+                            if (flags_token->token_type == response_token_t::token_type_t::LIST)
+                            {
+                                for (const auto& flag_token : flags_token->parenthesized_list)
+                                    add_flag(flag_token);
+                            }
+                            else if (flags_token->token_type == response_token_t::token_type_t::ATOM)
+                            {
+                                add_flag(flags_token);
+                            }
+                        }
+                    }
+                };
                 for (auto part : mandatory_part_)
                     if (part->token_type == response_token_t::token_type_t::LIST)
                     {
@@ -551,14 +599,7 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                         {
                             if ((*token)->token_type == response_token_t::token_type_t::ATOM)
                             {
-                                if (iequals((*token)->atom, "UID"))
-                                {
-                                    token++;
-                                    if (token == part->parenthesized_list.end())
-                                        throw imap_error("No uid number when fetching a message.", "");
-                                    uid_no = stoul((*token)->atom);
-                                }
-                                else if (iequals((*token)->atom, RFC822_TOKEN)
+                                if (iequals((*token)->atom, RFC822_TOKEN)
                                          || iequals((*token)->atom, "BODY[]")
                                          || iequals((*token)->atom, "BODY.PEEK[]")
                                          || iequals((*token)->atom, "RFC822.HEADER")
@@ -606,21 +647,8 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                             trim_eol(tail);
                         parse_response(tail);
                     }
-                    // After reading the literal, rescan the FETCH data list for UID if it was placed after the literal.
-                    if (uid_no == 0 && fetch_list_token != nullptr)
-                    {
-                        for (auto token = fetch_list_token->parenthesized_list.begin(); token != fetch_list_token->parenthesized_list.end(); token++) {
-                            
-                            if ((*token)->token_type == response_token_t::token_type_t::ATOM && iequals((*token)->atom, "UID"))
-                            {
-                                token++;
-                                if (token == fetch_list_token->parenthesized_list.end())
-                                throw imap_error("No uid number when fetching a message.", "");
-                                uid_no = stoul((*token)->atom);
-                                break;
-                            }
-                        }
-                    }
+                    // After reading the literal, parse UID/FLAGS data (best-effort for flags).
+                    parse_fetch_metadata();
                     // If no UID was found but we used UID FETCH, signal an error now that the full response was parsed.
                     if (is_uids && uid_no == 0)
                         throw imap_error("No UID when fetching a message.", "");
@@ -703,7 +731,8 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                             move(raw),
                             uid_no,
                             sequence_no,
-                            move(dedupe_hash)
+                            move(dedupe_hash),
+                            move(message_flags)
                         )
                     );
                     

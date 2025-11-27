@@ -371,6 +371,16 @@ std::string message::dedupe_hash() const
     return dedupe_hash_;
 }
 
+void message::flags(const vector<string>& flags)
+{
+    flags_ = flags;
+}
+
+vector<string> message::flags() const
+{
+    return flags_;
+}
+
 void message::add_in_reply_to(const string& in_reply)
 {
     const regex r(MESSAGE_ID_REGEX);

@@ -423,6 +423,20 @@ public:
     Getting the deduplication hash if set, otherwise an empty string.
     */
     std::string dedupe_hash() const;
+
+    /**
+    Replace the current list of IMAP flags reported for this message.
+
+    @param flags List of flags (e.g. \\Seen, \\Draft) returned by IMAP FETCH.
+    */
+    void flags(const std::vector<std::string>& flags);
+
+    /**
+    Retrieve the stored IMAP flags.
+
+    @return Copy of the flags vector, empty if not provided by the server.
+    */
+    std::vector<std::string> flags() const;
     
     /**
     Adding the in-reply-to ID.
@@ -864,6 +878,11 @@ protected:
     Optional deduplication hash computed from the raw message bytes.
     */
     std::string dedupe_hash_;
+
+    /**
+    IMAP flags reported for the message (e.g. \\Seen, \\Answered).
+    */
+    std::vector<std::string> flags_;
     
     /**
     In reply to list of IDs.

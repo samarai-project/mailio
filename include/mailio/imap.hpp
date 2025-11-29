@@ -711,6 +711,14 @@ public:
     high_level_folders_list_t list_folders_high_level();
 
     /**
+    Return server CAPABILITY tokens, cached for the lifetime of this imap instance.
+
+    The first call issues CAPABILITY and stores the returned atoms. Subsequent calls
+    return the cached list without additional network I/O.
+    */
+    const std::vector<std::string>& capabilities();
+
+    /**
     Deleting a folder.
 
     @param folder_name Folder to delete.
@@ -1003,6 +1011,14 @@ protected:
     Folder delimiter string determined by the IMAP server.
     **/
     std::string folder_delimiter_;
+
+    // Cached capabilities (per-session)
+    std::vector<std::string> capabilities_cache_;
+    bool capabilities_cached_ = false;
+
+    // Cached SPECIAL-USE attr->mailbox mapping (per-session)
+    special_use_by_attr_map_t special_use_by_attr_cache_;
+    bool special_use_by_attr_cached_ = false;
 
     /**
     Parsed elements of IMAP response line.

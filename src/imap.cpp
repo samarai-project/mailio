@@ -1392,6 +1392,15 @@ auto imap::list_special_use(bool only_special) -> special_use_map_t
 
     special_use_map_t result;
 
+    // Use cached server capabilities to decide which commands to issue.
+    const auto &caps = capabilities();
+    auto has_cap = [&](const string &needle) -> bool {
+        for (const auto &c : caps)
+            if (iequals(c, needle))
+                return true;
+        return false;
+    };
+
     auto parse_and_collect = [&](const string& command, const vector<string>& accept_atoms) -> bool
     {
         // Returns true if the command completed with tagged OK. Returns false on tagged NO/BAD.
@@ -1503,24 +1512,80 @@ auto imap::list_special_use(bool only_special) -> special_use_map_t
         return true;
     };
 
-    // Try preferred: LIST RETURN (SPECIAL-USE)
-    bool ok = parse_and_collect("LIST \"\" \"*\" RETURN (SPECIAL-USE)", {"LIST"});
-    if (!ok || (only_special && result.empty()))
-    {
-        // Fallback to XLIST
+    // Try preferred: LIST RETURN (SPECIAL-USE) if server advertises SPECIAL-USE
+    bool ok = false;
+    if (has_cap("SPECIAL-USE"))
+        ok = parse_and_collect("LIST \"\" \"*\" RETURN (SPECIAL-USE)", {"LIST"});
+
+    // If SPECIAL-USE failed or empty, try XLIST only if server advertises XLIST
+    if ((!ok || result.empty()) && has_cap("XLIST"))
         (void)parse_and_collect("XLIST \"\" \"*\"", {"XLIST", "LIST"});
-        if (result.empty())
-        {
-            // Last resort: plain LIST
-            (void)parse_and_collect("LIST \"\" \"*\"", {"LIST"});
-        }
-    }
+
+    // When only_special=true, avoid issuing a plain LIST fallback (which returns no special-use attrs)
+    // to prevent duplicate full LIST calls in higher-level functions.
+    if (!only_special && result.empty())
+        (void)parse_and_collect("LIST \"\" \"*\"", {"LIST"});
 
     return result;
 }
 
+const std::vector<std::string>& imap::capabilities()
+{
+    if (capabilities_cached_)
+        return capabilities_cache_;
+
+    capabilities_cache_.clear();
+    try
+    {
+        dlg_->send(format("CAPABILITY"));
+        bool has_more = true;
+        while (has_more)
+        {
+            string line = dlg_->receive();
+            auto parsed_line = parse_tag_result(line);
+            if (parsed_line.tag == UNTAGGED_RESPONSE)
+            {
+                try
+                {
+                    reset_response_parser();
+                    parse_response(parsed_line.response);
+                    // Expect: * CAPABILITY <tokens...>
+                    if (!mandatory_part_.empty() && mandatory_part_.front()->token_type == response_token_t::token_type_t::ATOM &&
+                        iequals(mandatory_part_.front()->atom, "CAPABILITY"))
+                    {
+                        mandatory_part_.pop_front();
+                        for (const auto &tok : mandatory_part_)
+                            if (tok->token_type == response_token_t::token_type_t::ATOM)
+                                capabilities_cache_.push_back(tok->atom);
+                    }
+                }
+                catch (...)
+                {
+                    reset_response_parser();
+                }
+            }
+            else if (parsed_line.tag == to_string(tag_))
+            {
+                has_more = false;
+            }
+        }
+        reset_response_parser();
+    }
+    catch (...)
+    {
+        reset_response_parser();
+    }
+
+    capabilities_cached_ = true;
+    return capabilities_cache_;
+}
+
 auto imap::list_special_use_by_attr() -> special_use_by_attr_map_t
 {
+    // Return cached mapping if already computed for this session.
+    if (special_use_by_attr_cached_)
+        return special_use_by_attr_cache_;
+
     // Use the best-effort collector and invert into attr->mailbox map.
     // We want only special-use mailboxes, so filter client-side.
     auto per_mailbox = list_special_use(true);
@@ -1539,7 +1604,7 @@ auto imap::list_special_use_by_attr() -> special_use_by_attr_map_t
         return attr; // pass-through unknowns
     };
 
-    special_use_by_attr_map_t out;
+    special_use_by_attr_cache_.clear();
     for (const auto& kv : per_mailbox)
     {
         const auto& mailbox = kv.first;
@@ -1547,11 +1612,12 @@ auto imap::list_special_use_by_attr() -> special_use_by_attr_map_t
         for (const auto& a : attrs)
         {
             string canon = normalize(a);
-            if (!canon.empty() && out.find(canon) == out.end())
-                out.emplace(canon, mailbox);
+            if (!canon.empty() && special_use_by_attr_cache_.find(canon) == special_use_by_attr_cache_.end())
+                special_use_by_attr_cache_.emplace(canon, mailbox);
         }
     }
-    return out;
+    special_use_by_attr_cached_ = true;
+    return special_use_by_attr_cache_;
 }
 
 auto imap::list_folders_interest() -> folders_interest_list_t
@@ -1654,9 +1720,9 @@ auto imap::list_folders_high_level() -> high_level_folders_list_t
 {
     high_level_folders_list_t out;
 
-    auto special = list_special_use_by_attr();
+    list_special_use_by_attr(); // ensure it ran once
     map<string, vector<string>> special_by_mailbox;
-    for (const auto& kv : special)
+    for (const auto& kv : special_use_by_attr_cache_)
         special_by_mailbox[kv.second].push_back(kv.first);
 
     mailbox_folder_t tree = list_folders("");

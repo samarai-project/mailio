@@ -698,6 +698,7 @@ void mime::parse_content()
         {
             quoted_printable qp(static_cast<string::size_type>(line_policy_), static_cast<string::size_type>(line_policy_));
             qp.strict_mode(strict_codec_mode_);
+            qp.user_content_mode(true);
             content_ = qp.decode(parsed_body_);
             break;
         }

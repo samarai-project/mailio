@@ -30,7 +30,7 @@ namespace mailio
 
 
 quoted_printable::quoted_printable(string::size_type line1_policy, string::size_type lines_policy) :
-    codec(line1_policy, lines_policy), q_codec_mode_(false)
+    codec(line1_policy, lines_policy), q_codec_mode_(false), user_content_mode_(false)
 {
 }
 
@@ -217,10 +217,19 @@ string quoted_printable::decode(const vector<string>& text) const
             throw codec_error("Bad line policy.");
 
         bool soft_break = false;
+        const bool relaxed_user_content = user_content_mode_ && !strict_mode_;
         for (string::const_iterator ch = line.begin(); ch != line.end(); ch++)
         {
             if (!is_allowed(*ch))
+            {
+                // In permissive body mode we mimic MUAs and pass through high-bit bytes.
+                if (relaxed_user_content && static_cast<unsigned char>(*ch) > 127)
+                {
+                    dec_text += *ch;
+                    continue;
+                }
                 throw codec_error("Bad character (quoted decode) `" + string(1, *ch) + "`.");
+            }
 
             if (*ch == EQUAL_CHAR)
             {
@@ -230,14 +239,40 @@ string quoted_printable::decode(const vector<string>& text) const
                     continue;
                 }
 
+                // Some servers emit naked '=' or truncated sequences; treat them literally when relaxed.
+                const auto remaining = static_cast<string::size_type>(line.end() - ch);
+                if (remaining < 3)
+                {
+                    if (relaxed_user_content)
+                    {
+                        dec_text += *ch;
+                        continue;
+                    }
+                    throw codec_error("Bad hexadecimal digit.");
+                }
+
                 // Avoid exception: Convert to uppercase.
                 char next_char = toupper(*(ch + 1));
                 char next_next_char = toupper(*(ch + 2));
                 if (!is_allowed(next_char) || !is_allowed(next_next_char))
+                {
+                    if (relaxed_user_content)
+                    {
+                        dec_text += *ch;
+                        continue;
+                    }
                     throw codec_error("Bad character (quoted decode upper).");
+                }
 
                 if (HEX_DIGITS.find(next_char) == string::npos || HEX_DIGITS.find(next_next_char) == string::npos)
+                {
+                    if (relaxed_user_content)
+                    {
+                        dec_text += *ch;
+                        continue;
+                    }
                     throw codec_error("Bad hexadecimal digit.");
+                }
                 int nc_val = hex_digit_to_int(next_char);
                 int nnc_val = hex_digit_to_int(next_next_char);
                 dec_text += ((nc_val << 4) + nnc_val);
@@ -263,6 +298,11 @@ string quoted_printable::decode(const vector<string>& text) const
 void quoted_printable::q_codec_mode(bool mode)
 {
     q_codec_mode_ = mode;
+}
+
+void quoted_printable::user_content_mode(bool mode)
+{
+    user_content_mode_ = mode;
 }
 
 

@@ -81,6 +81,14 @@ public:
     **/
     void q_codec_mode(bool mode);
 
+    /**
+    Treat decoded data as user-controlled content (message body, attachments, etc.).
+    This relaxes character validation when strict mode is disabled to mimic MUAs.
+
+    @param mode True to enable user content mode, false to disable.
+    **/
+    void user_content_mode(bool mode);
+
 private:
 
     /**
@@ -95,6 +103,11 @@ private:
     Flag for the Q codec mode.
     **/
     bool q_codec_mode_;
+
+    /**
+    Flag indicating whether the decoded data originates from user-controlled content.
+    **/
+    bool user_content_mode_;
 };
 
 

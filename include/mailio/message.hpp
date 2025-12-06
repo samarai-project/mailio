@@ -180,6 +180,19 @@ public:
     bool suspicious() const { return suspicious_; }
 
     /**
+    Flag indicating the message is an obvious no-reply/auto-generated email.
+
+    Detection is conservative and only marks clear cases (e.g., addresses
+    containing variants of "noreply" or headers like Auto-Submitted: auto-generated).
+    */
+    bool no_reply() const { return no_reply_; }
+
+    /**
+    Set the no-reply flag.
+    */
+    void no_reply(bool value) { no_reply_ = value; }
+
+    /**
     Setting the author to a given address.
 
     The given address is set as the only one, others are deleted.
@@ -924,6 +937,11 @@ protected:
 
     // Flag indicating potential abuse based on parsing anomalies in non-strict mode
     bool suspicious_{false};
+    
+    /**
+    Conservatively detected no-reply flag.
+    */
+    bool no_reply_{false};
     
 };
 

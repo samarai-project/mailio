@@ -467,6 +467,84 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                 msg.flags(std::get<4>(ms.second));
                 msg.line_policy(line_policy);
                 msg.parse(std::get<0>(ms.second));
+
+                // Conservative no-reply/auto-generated detection
+                auto is_obvious_noreply_local = [](const std::string& addr) -> bool {
+                    if (addr.empty()) return false;
+                    std::string a = boost::to_lower_copy(addr);
+                    // Check local part (before '@') for clear patterns
+                    auto at = a.find('@');
+                    std::string local = (at != std::string::npos) ? a.substr(0, at) : a;
+                    if (local.find("noreply") != std::string::npos) return true;
+                    if (local.find("no-reply") != std::string::npos) return true;
+                    if (local.find("do-not-reply") != std::string::npos) return true;
+                    if (local.find("donotreply") != std::string::npos) return true;
+                    if (local.find("auto-reply") != std::string::npos) return true;
+                    return false;
+                };
+
+                auto& headers = msg.headers();
+                auto header_has = [&](const std::string& name, const std::string& contains) -> bool {
+                    auto range = headers.equal_range(name);
+                    for (auto it = range.first; it != range.second; ++it)
+                    {
+                        std::string v = boost::to_lower_copy(it->second);
+                        if (v.find(boost::to_lower_copy(contains)) != std::string::npos)
+                            return true;
+                    }
+                    return false;
+                };
+
+                bool mark_no_reply = false;
+                // Check Reply-To (primary signal for no-reply mailboxes)
+                {
+                    auto ra = msg.reply_address();
+                    if (!ra.address.empty() && is_obvious_noreply_local(ra.address))
+                        mark_no_reply = true;
+                }
+                // Check Sender
+                if (!mark_no_reply)
+                {
+                    auto se = msg.sender();
+                    if (!se.address.empty() && is_obvious_noreply_local(se.address))
+                        mark_no_reply = true;
+                }
+                // Check From addresses
+                if (!mark_no_reply)
+                {
+                    auto froms = msg.from();
+                    for (const auto& ma : froms.addresses)
+                    {
+                        if (!ma.address.empty() && is_obvious_noreply_local(ma.address))
+                        {
+                            mark_no_reply = true;
+                            break;
+                        }
+                    }
+                }
+                // Check clear headers indicating auto-generation
+                if (!mark_no_reply)
+                {
+                    if (header_has("Auto-Submitted", "auto-generated") ||
+                        header_has("Auto-Submitted", "auto-replied"))
+                    {
+                        mark_no_reply = true;
+                    }
+                    else if (header_has("X-Auto-Response-Suppress", "all") ||
+                             header_has("X-Auto-Response-Suppress", "dr;rn;autoreply"))
+                    {
+                        mark_no_reply = true;
+                    }
+                    else if (header_has("Precedence", "bulk") ||
+                             header_has("Precedence", "list"))
+                    {
+                        // Bulk/list often are mailshot notifications; still conservative.
+                        mark_no_reply = true;
+                    }
+                }
+                if (mark_no_reply)
+                    msg.no_reply(true);
+                    
             }
             catch (const dialog_error &ex)
             {

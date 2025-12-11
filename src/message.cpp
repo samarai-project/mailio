@@ -886,35 +886,40 @@ void message::parse_header_line(const string& header_line)
             auto ids = parse_many_ids(header_value);
             if (!ids.empty())
                 message_id_ = ids[0];
+            // Preserve raw header as well for clients that need extra info
+            headers_.insert(make_pair(header_name, header_value));
         }
         catch (const std::exception& e)
         {
             if (strict_mode_) throw;
             // Best effort: keep raw header value as message id
             message_id_ = header_value;
+            headers_.insert(make_pair(header_name, header_value));
             append_error("Message-ID parsing warning", e);
         }
     }
     else if (iequals(header_name, IN_REPLY_TO_HEADER))
     {
-        try { in_reply_to_ = parse_many_ids(header_value); }
+        try { in_reply_to_ = parse_many_ids(header_value); headers_.insert(make_pair(header_name, header_value)); }
         catch (const std::exception& e)
         {
             if (strict_mode_) throw;
             // Keep raw value as a single token
             in_reply_to_.clear();
             in_reply_to_.push_back(header_value);
+            headers_.insert(make_pair(header_name, header_value));
             append_error("In-Reply-To parsing warning", e);
         }
     }
     else if (iequals(header_name, REFERENCES_HEADER))
     {
-        try { references_ = parse_many_ids(header_value); }
+        try { references_ = parse_many_ids(header_value); headers_.insert(make_pair(header_name, header_value)); }
         catch (const std::exception& e)
         {
             if (strict_mode_) throw;
             references_.clear();
             references_.push_back(header_value);
+            headers_.insert(make_pair(header_name, header_value));
             append_error("References parsing warning", e);
         }
     }

@@ -472,36 +472,41 @@ string mime::format_many_ids(const string& id, const string& header_name) const
     return format_many_ids(vector<string>{id}, header_name);
 }
 
-
-vector<string> mime::parse_many_ids(const string& ids) const
+vector<string> mime::parse_many_ids(const string &ids) const
 {
-    if (!strict_mode_)
-        return vector<string>{ids};
-
+    // RFC 5322 §3.6.4: References = msg-id *(CFWS msg-id)
+    // msg-id = [CFWS] "<" id-left "@" id-right ">" [CFWS]
+    // CFWS (comments + folding whitespace) may appear before/between/after IDs.
     vector<string> idv;
+
+    const string ANGLED_MESSAGE_ID_REGEX = codec::LESS_THAN_STR + MESSAGE_ID_REGEX + codec::GREATER_THAN_STR;
+    const regex rgx(ANGLED_MESSAGE_ID_REGEX);
+
     auto start = ids.cbegin();
     auto end = ids.cend();
     match_flag_type flags = boost::match_default | boost::match_not_null;
     match_results<string::const_iterator> tokens;
-    bool all_tokens_parsed = false;
-    const string ANGLED_MESSAGE_ID_REGEX = codec::LESS_THAN_STR + MESSAGE_ID_REGEX + codec::GREATER_THAN_STR;
-    const regex rgx(ANGLED_MESSAGE_ID_REGEX);
+
     while (regex_search(start, end, tokens, rgx, flags))
     {
         string id = tokens[0];
         trim_left_if(id, is_any_of(codec::LESS_THAN_STR));
         trim_right_if(id, is_any_of(codec::GREATER_THAN_STR));
         idv.push_back(id);
-        start = tokens[0].second;
-        all_tokens_parsed = (start == end);
+        start = tokens[0].second; // continue scanning after this match
     }
 
-    if (!all_tokens_parsed)
-        throw mime_error("Parsing failure of the ID.", "ID is `" + ids + "`.");
+    if (strict_mode_)
+    {
+        if (idv.empty())
+        {
+            // Provide descriptive details to aid clients.
+            throw mime_error("Parsing failure of the ID.", "No <msg-id> found. Header=`" + ids + "`. Expected angle-bracketed ids per RFC 5322 §3.6.4.");
+        }
+    }
 
     return idv;
 }
-
 
 string mime::format_header() const
 {

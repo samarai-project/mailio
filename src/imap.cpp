@@ -61,6 +61,7 @@ using boost::trim;
 using boost::algorithm::trim_copy_if;
 using boost::algorithm::trim_if;
 using boost::algorithm::is_any_of;
+ 
 
 
 namespace mailio
@@ -893,6 +894,8 @@ void imap::append(const string& folder_name, const message& msg)
 
 auto imap::statistics(const string& mailbox, unsigned int info) -> mailbox_stat_t
 {
+    mailbox_stat_t stat;
+    stat.mailbox_name = mailbox;
     // It doesn't like search terms it doesn't recognize.
     // Some older protocol versions or some servers may not support them.
     // So unseen uidnext and uidvalidity are optional.
@@ -903,10 +906,13 @@ auto imap::statistics(const string& mailbox, unsigned int info) -> mailbox_stat_
         cmd += " uidnext";
     if (info & mailbox_stat_t::UID_VALIDITY)
         cmd += " uidvalidity";
+    // Only request HIGHESTMODSEQ if asked for and the server advertises CONDSTORE.
+    if ((info & mailbox_stat_t::HIGHEST_MODSEQ) &&
+        std::find_if(capabilities().begin(), capabilities().end(), [](const std::string &cap){ return boost::iequals(cap, "CONDSTORE"); }) != capabilities().end())
+        cmd += " highestmodseq";
     cmd += ")";
 
     dlg_->send(format(cmd));
-    mailbox_stat_t stat;
 
     bool has_more = true;
     try
@@ -958,6 +964,11 @@ auto imap::statistics(const string& mailbox, unsigned int info) -> mailbox_stat_
                                 {
                                     stat.uid_validity = stoul(value);
                                 }
+                                else if (iequals(key, "HIGHESTMODSEQ"))
+                                {
+                                    // RFC 7162: mod-sequence is a 64-bit integer.
+                                    stat.highest_modseq = std::stoull(value);
+                                }
                                 key_found = false;
                             }
                             else
@@ -973,10 +984,17 @@ auto imap::statistics(const string& mailbox, unsigned int info) -> mailbox_stat_
             }
             else if (parsed_line.tag == to_string(tag_))
             {
-                if (parsed_line.result.value() == tag_result_response_t::OK)
+                if (parsed_line.result.has_value() && parsed_line.result.value() == tag_result_response_t::OK)
+                {
                     has_more = false;
+                }
                 else
-                    throw imap_error("Getting statistics failure.", "Line=`" + line + "`.");
+                {
+                    // Best-effort: treat NO/BAD as missing/inaccessible mailbox instead of throwing.
+                    stat.not_exist = true;
+                    reset_response_parser();
+                    return stat;
+                }
             }
             else
                 throw imap_error("Parsing failure.", "Tag=`" + parsed_line.tag + "`.");
@@ -1000,7 +1018,109 @@ auto imap::statistics(const list<string>& folder_name, unsigned int info) -> mai
 {
     string delim = folder_delimiter();
     string folder_name_s = folder_tree_to_string(folder_name, delim);
-    return statistics(folder_name_s, info);
+    auto stat = statistics(folder_name_s, info);
+    stat.mailbox_name = folder_name_s;
+    return stat;
+}
+
+std::vector<imap::mailbox_stat_t> imap::bulk_status(const std::vector<std::string>& mailboxes)
+{
+    std::vector<mailbox_stat_t> out;
+    out.reserve(mailboxes.size());
+
+    const auto &caps = capabilities();
+    auto has_cap = [&](const std::string &cap){
+        return std::find_if(caps.begin(), caps.end(), [&](const std::string& c){ return iequals(c, cap); }) != caps.end();
+    };
+    const bool support_list_status = has_cap("LIST-STATUS");
+    const bool support_condstore = has_cap("CONDSTORE");
+
+    for (const auto &mb : mailboxes)
+    {
+        mailbox_stat_t stat; stat.mailbox_name = mb;
+        try
+        {
+            if (support_list_status)
+            {
+                string cmd = "LIST \"\" " + to_astring(mb) + " RETURN (STATUS (messages uidnext uidvalidity";
+                if (support_condstore)
+                    cmd += " highestmodseq";
+                cmd += "))";
+                dlg_->send(format(cmd));
+
+                bool has_more = true;
+                bool saw_any = false;
+                while (has_more)
+                {
+                    string line = dlg_->receive();
+                    auto parsed_line = parse_tag_result(line);
+                    if (parsed_line.tag == UNTAGGED_RESPONSE)
+                    {
+                        saw_any = true;
+                        // Best-effort parse: look for STATUS list and extract pairs.
+                        try
+                        {
+                            reset_response_parser();
+                            parse_response(parsed_line.response);
+                            // Search any LIST containing STATUS values.
+                            auto scan = [&](const std::list<std::shared_ptr<response_token_t>>& lst){
+                                for (const auto &tok : lst)
+                                {
+                                    if (tok->token_type == response_token_t::token_type_t::LIST)
+                                    {
+                                        bool key_found = false; string key;
+                                        for (const auto &sub : tok->parenthesized_list)
+                                        {
+                                            if (!key_found) { key = sub->atom; key_found = true; }
+                                            else {
+                                                const string &value = sub->atom;
+                                                if (iequals(key, "MESSAGES")) stat.messages_no = stoul(value);
+                                                else if (iequals(key, "UIDNEXT")) stat.uid_next = stoul(value);
+                                                else if (iequals(key, "UIDVALIDITY")) stat.uid_validity = stoul(value);
+                                                else if (iequals(key, "HIGHESTMODSEQ")) stat.highest_modseq = std::stoull(value);
+                                                key_found = false;
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                            scan(mandatory_part_);
+                            scan(optional_part_);
+                            reset_response_parser();
+                        }
+                        catch (...)
+                        {
+                            reset_response_parser();
+                        }
+                    }
+                    else if (parsed_line.tag == to_string(tag_))
+                    {
+                        if (!parsed_line.result.has_value() || parsed_line.result.value() != tag_result_response_t::OK)
+                            throw imap_error("LIST-STATUS failure.", parsed_line.response);
+                        has_more = false;
+                    }
+                }
+                if (!saw_any)
+                    stat.not_exist = true;
+            }
+            else
+            {
+                unsigned int flags = mailbox_stat_t::UID_NEXT 
+                    | mailbox_stat_t::UID_VALIDITY 
+                    | mailbox_stat_t::HIGHEST_MODSEQ;
+                stat = statistics(mb, flags);
+                stat.mailbox_name = mb;
+            }
+        }
+        catch (...)
+        {
+            stat.not_exist = true;
+            reset_response_parser();
+        }
+        out.push_back(stat);
+    }
+
+    return out;
 }
 
 

@@ -59,7 +59,13 @@ public:
         /**
         Statistics information to be retrieved.
         **/
-        enum stat_info_t {DEFAULT = 0, UNSEEN = 1, UID_NEXT = 2, UID_VALIDITY = 4};
+        enum stat_info_t {
+            DEFAULT = 0, 
+            UNSEEN = 1, 
+            UID_NEXT = 2, 
+            UID_VALIDITY = 4, 
+            HIGHEST_MODSEQ = 8
+        };
 
         /**
         Number of messages in the mailbox.
@@ -100,12 +106,43 @@ public:
         unsigned long uid_validity;
 
         /**
+        The non-zero highest modification sequence number of the mailbox (CONDSTORE/QRESYNC).
+
+        Zero indicates the server did not report this or does not support CONDSTORE.
+        **/
+        unsigned long long highest_modseq;
+
+        /** Name of the mailbox these stats correspond to. */
+        std::string mailbox_name;
+
+        /** True if the mailbox does not exist or is not accessible. */
+        bool not_exist{false};
+
+        /**
         Setting the number of messages to zero.
         **/
-        mailbox_stat_t() : messages_no(0), messages_recent(0), messages_unseen(0), messages_first_unseen(0), uid_next(0), uid_validity(0)
+        mailbox_stat_t() : messages_no(0), messages_recent(0), messages_unseen(0), messages_first_unseen(0), uid_next(0), uid_validity(0), highest_modseq(0)
         {
         }
     };
+
+    /**
+    Bulk STATUS across multiple mailboxes using best-effort semantics.
+
+    If the server advertises LIST-STATUS, the method prefers issuing LIST RETURN (STATUS ...)
+    per mailbox; otherwise it falls back to a simple STATUS loop using `statistics()`.
+
+    The returned vector always has one entry per requested mailbox, preserving order. For
+    non-existent or inaccessible mailboxes, the corresponding `mailbox_stat_t` will have
+    `not_exist=true` and other fields set to zero.
+
+    Fields populated: MESSAGES, UIDNEXT, UIDVALIDITY, and HIGHESTMODSEQ when supported
+    (CONDSTORE capability) and available in server responses.
+
+    @param mailboxes  List of mailbox names to query.
+    @return           Vector of mailbox_stat_t in the same order as input.
+    */
+    std::vector<mailbox_stat_t> bulk_status(const std::vector<std::string>& mailboxes);
 
     /**
     Mailbox folder tree.

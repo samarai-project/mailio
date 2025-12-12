@@ -320,6 +320,13 @@ auto imap::select(const string& mailbox, bool read_only) -> mailbox_stat_t
                                 throw imap_error("Number expected for uidvalidity.", "Line=`" + line + "`.");
                             stat.uid_validity = stoul(value->atom);
                         }
+                        else if (iequals(key->atom, "HIGHESTMODSEQ"))
+                        {
+                            if (value->token_type != response_token_t::token_type_t::ATOM)
+                                throw imap_error("Number expected for highestmodseq.", "Line=`" + line + "`.");
+                            // RFC 7162 specifies a 64-bit mod-sequence.
+                            stat.highest_modseq = std::stoull(value->atom);
+                        }
                     }
                 }
                 else
@@ -1776,6 +1783,67 @@ const std::vector<std::string>& imap::capabilities()
 
     capabilities_cached_ = true;
     return capabilities_cache_;
+}
+
+void imap::enable(const std::vector<std::string>& extensions)
+{
+    // Build ENABLE command with space-separated extension tokens.
+    std::string cmd = "ENABLE";
+    if (!extensions.empty())
+    {
+        cmd += TOKEN_SEPARATOR_STR;
+        cmd += boost::algorithm::join(extensions, TOKEN_SEPARATOR_STR);
+    }
+
+    dlg_->send(format(cmd));
+
+    bool has_more = true;
+    try
+    {
+        while (has_more)
+        {
+            reset_response_parser();
+            std::string line = dlg_->receive();
+            tag_result_response_t parsed_line = parse_tag_result(line);
+
+            if (parsed_line.tag == UNTAGGED_RESPONSE)
+            {
+                // Best-effort: parse and ignore ENABLED payload if present.
+                try
+                {
+                    parse_response(parsed_line.response);
+                    // Expect optional: * ENABLED <tokens...>
+                    // No state changes are required here; ignore content.
+                }
+                catch (...)
+                {
+                    // Ignore parse failures on unsolicited lines.
+                    reset_response_parser();
+                    continue;
+                }
+            }
+            else if (parsed_line.tag == to_string(tag_))
+            {
+                if (!parsed_line.result.has_value() || parsed_line.result.value() != tag_result_response_t::OK)
+                    throw imap_error("ENABLE failure.", "Response=`" + parsed_line.response + "`.");
+                has_more = false;
+            }
+            else
+            {
+                throw imap_error("Incorrect tag parsed.", "Tag=`" + parsed_line.tag + "`.");
+            }
+        }
+    }
+    catch (const std::invalid_argument& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+    catch (const std::out_of_range& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+
+    reset_response_parser();
 }
 
 auto imap::list_special_use_by_attr() -> special_use_by_attr_map_t

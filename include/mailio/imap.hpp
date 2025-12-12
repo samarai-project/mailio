@@ -756,6 +756,20 @@ public:
     const std::vector<std::string>& capabilities();
 
     /**
+    Issue RFC 5161 ENABLE with a list of extensions to activate.
+
+    Sends: ENABLE <ext1> <ext2> ... and waits for the tagged OK.
+    Best-effort parses any untagged ENABLED response but does not
+    alter cached capabilities. Throws on tagged NO/BAD.
+
+    Example: enable({"CONDSTORE", "UTF8=ACCEPT"}).
+
+    @param extensions  Capability/extension tokens to enable.
+    @throw imap_error  If the server rejects the command or parsing fails.
+    */
+    void enable(const std::vector<std::string>& extensions);
+
+    /**
     Deleting a folder.
 
     @param folder_name Folder to delete.

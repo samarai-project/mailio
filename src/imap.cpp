@@ -1326,6 +1326,239 @@ unsigned long imap::uid_from_sequence_no(unsigned long seq_no)
 }
 
 
+auto imap::changed_since(unsigned long long mod_seq) -> changed_since_result_t
+{
+    // CHANGEDSINCE is defined by RFC 7162 (CONDSTORE/QRESYNC). Require that the server advertises it.
+    const auto &caps = capabilities();
+    const bool support_condstore = std::find_if(caps.begin(), caps.end(), [](const std::string &cap){ return boost::iequals(cap, "CONDSTORE"); }) != caps.end();
+    const bool support_qresync = std::find_if(caps.begin(), caps.end(), [](const std::string &cap){ return boost::iequals(cap, "QRESYNC"); }) != caps.end();
+    if (!support_condstore && !support_qresync)
+        throw imap_error("Server does not support CONDSTORE/QRESYNC.", "");
+
+    // Always use UID FETCH since callers want UIDs; sequence numbers are included only if present.
+    // Ask for UID/FLAGS/MODSEQ and apply CHANGEDSINCE.
+    std::string cmd = "UID FETCH 1:* (UID FLAGS MODSEQ) (CHANGEDSINCE " + std::to_string(mod_seq) + ")";
+    dlg_->send(format(cmd));
+
+    changed_since_result_t result;
+    // De-duplicate by UID; some servers may emit multiple FETCH lines per message.
+    std::map<unsigned long, changed_since_result_t::changed_message_t> changed_by_uid;
+    std::vector<unsigned long> changed_order;
+    bool has_more = true;
+
+    // Parse uid-set strings like "1:4,9,11:12".
+    auto parse_uid_set = [&](const std::string& uidset) -> std::vector<unsigned long> {
+        std::vector<unsigned long> out;
+        std::vector<std::string> parts;
+        boost::split(parts, uidset, boost::is_any_of(LIST_SEPARATOR));
+        for (auto p : parts)
+        {
+            boost::trim(p);
+            if (p.empty() || p == RANGE_ALL)
+                continue;
+            auto colon = p.find(RANGE_SEPARATOR);
+            if (colon == std::string::npos)
+            {
+                out.push_back(std::stoul(p));
+                continue;
+            }
+            auto a = p.substr(0, colon);
+            auto b = p.substr(colon + 1);
+            boost::trim(a);
+            boost::trim(b);
+            if (a.empty() || b.empty() || a == RANGE_ALL || b == RANGE_ALL)
+                continue;
+            unsigned long start = std::stoul(a);
+            unsigned long end = std::stoul(b);
+            if (end < start)
+                std::swap(start, end);
+            // Expand ranges; callers can de-dup if needed.
+            for (unsigned long v = start; v <= end; ++v)
+            {
+                out.push_back(v);
+                if (v == std::numeric_limits<unsigned long>::max())
+                    break;
+            }
+        }
+        return out;
+    };
+
+    try
+    {
+        while (has_more)
+        {
+            reset_response_parser();
+            std::string line = dlg_->receive();
+            tag_result_response_t parsed_line = parse_tag_result(line);
+
+            if (parsed_line.tag == UNTAGGED_RESPONSE)
+            {
+                parse_response(parsed_line.response);
+                // Handle optional VANISHED responses if present.
+                if (!mandatory_part_.empty() && mandatory_part_.front()->token_type == response_token_t::token_type_t::ATOM &&
+                    iequals(mandatory_part_.front()->atom, "VANISHED"))
+                {
+                    // Expected: VANISHED [EARLIER] <uidset>
+                    mandatory_part_.pop_front();
+                    if (!mandatory_part_.empty() && mandatory_part_.front()->token_type == response_token_t::token_type_t::ATOM &&
+                        iequals(mandatory_part_.front()->atom, "EARLIER"))
+                        mandatory_part_.pop_front();
+
+                    if (!mandatory_part_.empty() && mandatory_part_.front()->token_type == response_token_t::token_type_t::ATOM)
+                    {
+                        auto uids = parse_uid_set(mandatory_part_.front()->atom);
+                        result.vanished_uids.insert(result.vanished_uids.end(), uids.begin(), uids.end());
+                    }
+                    continue;
+                }
+
+                // Expect: * <seq> FETCH (...)
+                if (mandatory_part_.empty() || mandatory_part_.front()->token_type != response_token_t::token_type_t::ATOM)
+                    continue;
+
+                std::optional<unsigned long> seq_opt;
+                try
+                {
+                    unsigned long seq = std::stoul(mandatory_part_.front()->atom);
+                    if (seq != 0)
+                        seq_opt = seq;
+                }
+                catch (...)
+                {
+                    continue; // unsolicited untagged
+                }
+                mandatory_part_.pop_front();
+
+                if (mandatory_part_.empty() || mandatory_part_.front()->token_type != response_token_t::token_type_t::ATOM ||
+                    !iequals(mandatory_part_.front()->atom, "FETCH"))
+                    continue;
+
+                unsigned long uid = 0;
+                std::vector<std::string> flags;
+                std::optional<unsigned long long> msg_modseq;
+
+                // Find the FETCH attribute list and scan it.
+                for (const auto& part : mandatory_part_)
+                {
+                    if (part->token_type != response_token_t::token_type_t::LIST)
+                        continue;
+
+                    const auto& lst = part->parenthesized_list;
+                    for (auto it = lst.begin(); it != lst.end(); ++it)
+                    {
+                        const auto& tok = *it;
+                        if (!tok || tok->token_type != response_token_t::token_type_t::ATOM)
+                            continue;
+
+                        if (iequals(tok->atom, "UID"))
+                        {
+                            auto nx = it; ++nx;
+                            if (nx != lst.end() && *nx && (*nx)->token_type == response_token_t::token_type_t::ATOM)
+                                uid = std::stoul((*nx)->atom);
+                        }
+                        else if (iequals(tok->atom, "FLAGS"))
+                        {
+                            auto nx = it; ++nx;
+                            if (nx == lst.end() || !*nx)
+                                continue;
+                            const auto& ft = *nx;
+                            auto add_flag = [&](const std::shared_ptr<response_token_t>& flag_token) {
+                                if (flag_token && flag_token->token_type == response_token_t::token_type_t::ATOM && !flag_token->atom.empty())
+                                    flags.push_back(flag_token->atom);
+                            };
+                            if (ft->token_type == response_token_t::token_type_t::LIST)
+                            {
+                                for (const auto& f : ft->parenthesized_list)
+                                    add_flag(f);
+                            }
+                            else if (ft->token_type == response_token_t::token_type_t::ATOM)
+                            {
+                                add_flag(ft);
+                            }
+                        }
+                        else if (iequals(tok->atom, "MODSEQ"))
+                        {
+                            auto nx = it; ++nx;
+                            if (nx == lst.end() || !*nx)
+                                continue;
+                            const auto& mt = *nx;
+                            // MODSEQ is typically a list: (12345)
+                            if (mt->token_type == response_token_t::token_type_t::LIST && !mt->parenthesized_list.empty())
+                            {
+                                const auto& first = mt->parenthesized_list.front();
+                                if (first && first->token_type == response_token_t::token_type_t::ATOM)
+                                    msg_modseq = std::stoull(first->atom);
+                            }
+                            else if (mt->token_type == response_token_t::token_type_t::ATOM)
+                            {
+                                msg_modseq = std::stoull(mt->atom);
+                            }
+                        }
+                    }
+
+                    // Only one list is expected for FETCH attributes.
+                    break;
+                }
+
+                if (uid == 0)
+                {
+                    // Best-effort: skip odd FETCH responses that don't carry UID.
+                    debug_bugfix("CHANGEDSINCE skipped FETCH without UID: " + line);
+                    continue;
+                }
+
+                changed_since_result_t::changed_message_t cm;
+                cm.uid = uid;
+                cm.sequence_no = seq_opt;
+                cm.flags = std::move(flags);
+                cm.modseq = msg_modseq;
+
+                if (changed_by_uid.find(uid) == changed_by_uid.end())
+                    changed_order.push_back(uid);
+                changed_by_uid[uid] = std::move(cm);
+            }
+            else if (parsed_line.tag == to_string(tag_))
+            {
+                if (!parsed_line.result.has_value() || parsed_line.result.value() != tag_result_response_t::OK)
+                    throw imap_error("CHANGEDSINCE failure.", "Response=`" + parsed_line.response + "`.");
+                has_more = false;
+            }
+            else
+            {
+                throw imap_error("Parsing failure.", "Tag=`" + parsed_line.tag + "`." );
+            }
+        }
+    }
+    catch (const invalid_argument& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+    catch (const out_of_range& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+
+    reset_response_parser();
+    // Materialize de-duplicated changes preserving first-seen order.
+    result.changed.clear();
+    result.changed.reserve(changed_order.size());
+    for (auto uid : changed_order)
+    {
+        auto it = changed_by_uid.find(uid);
+        if (it != changed_by_uid.end())
+            result.changed.push_back(it->second);
+    }
+
+    // De-duplicate vanished UIDs (servers may repeat VANISHED on retransmission).
+    if (!result.vanished_uids.empty())
+    {
+        std::sort(result.vanished_uids.begin(), result.vanished_uids.end());
+        result.vanished_uids.erase(std::unique(result.vanished_uids.begin(), result.vanished_uids.end()), result.vanished_uids.end());
+    }
+    return result;
+}
+
+
 void imap::remove(const string& mailbox, unsigned long message_no, bool is_uid)
 {
     select(mailbox);

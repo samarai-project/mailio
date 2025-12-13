@@ -486,6 +486,48 @@ public:
     @throw imap_error  Parsing failure or server error.
     */
     unsigned long uid_from_sequence_no(unsigned long seq_no);
+
+    /**
+    Result of `changed_since()`.
+
+    `changed` contains per-message metadata for messages whose state changed since the provided MODSEQ.
+    `vanished_uids` is populated only if the server sends VANISHED responses (e.g. under QRESYNC);
+    otherwise it remains empty.
+    **/
+    struct changed_since_result_t
+    {
+        struct changed_message_t
+        {
+            /** UID of the changed message (always expected to be present). */
+            unsigned long uid{0};
+
+            /** Message sequence number from the untagged FETCH response, if available. */
+            std::optional<unsigned long> sequence_no;
+
+            /** Server-reported flags for the message, if present in the response. */
+            std::vector<std::string> flags;
+
+            /** Per-message MODSEQ value, if the server reported it. */
+            std::optional<unsigned long long> modseq;
+        };
+
+        std::vector<changed_message_t> changed;
+        std::vector<unsigned long> vanished_uids;
+    };
+
+    /**
+    List mailbox changes since a given MODSEQ using FETCH CHANGEDSINCE (RFC 7162, CONDSTORE/QRESYNC).
+
+    A mailbox must already be selected prior to calling this method.
+
+    The method issues a UID FETCH that requests UID/FLAGS/MODSEQ and applies the CHANGEDSINCE modifier.
+    It returns the changed messages and, when provided by the server, VANISHED UIDs.
+
+    @param mod_seq    Lower bound MODSEQ; changes strictly greater than this are returned.
+    @return           Structured change information.
+    @throw imap_error If the server does not support CONDSTORE/QRESYNC or on protocol/parse errors.
+    */
+    changed_since_result_t changed_since(unsigned long long mod_seq);
  
     /**
     Removing a message from the given mailbox.

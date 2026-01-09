@@ -64,7 +64,8 @@ public:
             UNSEEN = 1, 
             UID_NEXT = 2, 
             UID_VALIDITY = 4, 
-            HIGHEST_MODSEQ = 8
+            HIGHEST_MODSEQ = 8,
+            ALL = UNSEEN | UID_NEXT | UID_VALIDITY | HIGHEST_MODSEQ
         };
 
         /**
@@ -129,8 +130,14 @@ public:
     /**
     Bulk STATUS across multiple mailboxes using best-effort semantics.
 
-    If the server advertises LIST-STATUS, the method prefers issuing LIST RETURN (STATUS ...)
-    per mailbox; otherwise it falls back to a simple STATUS loop using `statistics()`.
+    If the server advertises LIST-STATUS, the method prefers issuing a single
+    LIST "" * RETURN (STATUS ...) and then filtering client-side.
+
+    Otherwise (common for Gmail/Outlook), it falls back to pipelining STATUS commands in
+    small batches with capped adaptive throttling. The goal is to avoid RTT-per-mailbox
+    latency and reduce rate-limit risk while keeping responses for ~100 mailboxes usually
+    in the seconds range. For very large mailbox counts, callers should implement additional
+    higher-level pacing.
 
     The returned vector always has one entry per requested mailbox, preserving order. For
     non-existent or inaccessible mailboxes, the corresponding `mailbox_stat_t` will have
@@ -528,6 +535,43 @@ public:
     @throw imap_error If the server does not support CONDSTORE/QRESYNC or on protocol/parse errors.
     */
     changed_since_result_t changed_since(unsigned long long mod_seq);
+
+        /**
+        Reverse-lookup which Gmail labels changed since a global MODSEQ by scanning X-GM-LABELS.
+
+        Gmail exposes a global modification sequence number (MODSEQ) for the entire account,
+        not a per-mailbox one. That makes straightforward per-folder CONDSTORE sync awkward:
+        you can observe that "something changed" since the last MODSEQ, but you cannot tell
+        which label(s)/mailboxes were affected without additional queries.
+
+        This method is a Gmail-specific helper that performs that reverse lookup:
+
+        - It issues the following IMAP command against the currently selected mailbox:
+            `UID FETCH 1:* (X-GM-LABELS) (CHANGEDSINCE <last_modseq>)`
+        - It examines every returned untagged FETCH response and collects all label names
+            that appear in the `X-GM-LABELS` attribute.
+        - It returns a de-duplicated list of label names (mailboxes) that currently appear
+            on the changed messages.
+
+        Intended use:
+        - Select a mailbox that provides a near-complete view of the account (commonly
+            Gmail's "All Mail"), then call this method with the last seen MODSEQ.
+        - The returned label set can be used to decide which mailboxes should be synchronized
+            next due to metadata/flag changes.
+
+        Notes / limitations:
+        - A mailbox must already be selected prior to calling this method.
+        - Requires Gmail's `X-GM-EXT-1` extension (for `X-GM-LABELS`) and CONDSTORE/QRESYNC
+            (for `CHANGEDSINCE`).
+        - The method returns labels that are present *after* the change (current labels).
+            If a label was removed from a message, that removed label may not appear in the
+            result even though it was affected.
+
+        @param last_modseq Lower bound MODSEQ; changes strictly greater than this are returned.
+        @return            De-duplicated list of Gmail labels (mailbox names) observed on changed messages.
+        @throw imap_error  If required capabilities are missing or on protocol/parse errors.
+        */
+        std::vector<std::string> fetch_changed_gmail_labels(unsigned long long last_modseq);
  
     /**
     Removing a message from the given mailbox.

@@ -18,6 +18,9 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <string>
 #include <tuple>
 #include <functional>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/compare.hpp>
 #include <boost/algorithm/string/join.hpp>
@@ -1035,6 +1038,9 @@ std::vector<imap::mailbox_stat_t> imap::bulk_status(const std::vector<std::strin
     std::vector<mailbox_stat_t> out;
     out.reserve(mailboxes.size());
 
+    if (mailboxes.empty())
+        return out;
+
     const auto &caps = capabilities();
     auto has_cap = [&](const std::string &cap){
         return std::find_if(caps.begin(), caps.end(), [&](const std::string& c){ return iequals(c, cap); }) != caps.end();
@@ -1042,91 +1048,377 @@ std::vector<imap::mailbox_stat_t> imap::bulk_status(const std::vector<std::strin
     const bool support_list_status = has_cap("LIST-STATUS");
     const bool support_condstore = has_cap("CONDSTORE");
 
-    for (const auto &mb : mailboxes)
+    // Fast-path for a single mailbox: use the lightweight `STATUS` via `statistics()`.
+    // Avoiding LIST "" * for a single mailbox, which would happen with e.g. Gmail
+    if (mailboxes.size() == 1)
     {
-        mailbox_stat_t stat; stat.mailbox_name = mb;
+        unsigned int info = mailbox_stat_t::UID_NEXT | mailbox_stat_t::UID_VALIDITY;
+        if (support_condstore)
+            info |= mailbox_stat_t::HIGHEST_MODSEQ;
+        mailbox_stat_t stat = statistics(mailboxes.front(), info);
+        stat.mailbox_name = mailboxes.front();
+        out.push_back(std::move(stat));
+        return out;
+    }
+
+    auto normalize_mailbox = [](std::string s) -> std::string
+    {
+        boost::trim(s);
+        if (s.size() >= 2 && s.front() == '"' && s.back() == '"')
+            s = s.substr(1, s.size() - 2);
+        boost::trim(s);
+        return s;
+    };
+
+    // Helper: scan a parenthesized list for key/value pairs (MESSAGES/UIDNEXT/...).
+    auto scan_kv_pairs_in_list = [&](mailbox_stat_t& stat, const std::list<std::shared_ptr<response_token_t>>& pl)
+    {
+        bool key_found = false;
+        string key;
+        for (const auto& elem : pl)
+        {
+            if (elem->token_type != response_token_t::token_type_t::ATOM)
+            {
+                // Reset on non-atom to avoid dangling keys across nested lists.
+                key_found = false;
+                continue;
+            }
+            if (!key_found)
+            {
+                key = elem->atom;
+                key_found = true;
+                continue;
+            }
+
+            const string& value = elem->atom;
+            if (iequals(key, "MESSAGES")) stat.messages_no = stoul(value);
+            else if (iequals(key, "UIDNEXT")) stat.uid_next = stoul(value);
+            else if (iequals(key, "UIDVALIDITY")) stat.uid_validity = stoul(value);
+            else if (iequals(key, "HIGHESTMODSEQ")) stat.highest_modseq = std::stoull(value);
+            key_found = false;
+        }
+    };
+
+    // Helper: recursively walk tokens and capture any STATUS-like key/value lists, including LIST-STATUS nesting.
+    auto scan_token_tree = [&](auto&& self, mailbox_stat_t& stat, const std::list<std::shared_ptr<response_token_t>>& lst) -> void
+    {
+        for (const auto& tok : lst)
+        {
+            if (tok->token_type != response_token_t::token_type_t::LIST)
+                continue;
+
+            // Scan this list directly (covers plain STATUS responses: (MESSAGES 1 UIDNEXT 2 ...)).
+            scan_kv_pairs_in_list(stat, tok->parenthesized_list);
+
+            // Handle LIST-STATUS wrapper: (STATUS (MESSAGES 1 UIDNEXT 2 ...))
+            if (tok->parenthesized_list.size() >= 2)
+            {
+                auto it = tok->parenthesized_list.begin();
+                if ((*it)->token_type == response_token_t::token_type_t::ATOM && iequals((*it)->atom, "STATUS"))
+                {
+                    ++it;
+                    if (it != tok->parenthesized_list.end() && (*it)->token_type == response_token_t::token_type_t::LIST)
+                        scan_kv_pairs_in_list(stat, (*it)->parenthesized_list);
+                }
+            }
+
+            // Recurse into nested lists.
+            self(self, stat, tok->parenthesized_list);
+        }
+    };
+
+    // Helper: parse an untagged STATUS response and update stats_by_name.
+    auto parse_untagged_status = [&](const std::string& response, std::unordered_map<std::string, mailbox_stat_t>& stats_by_name) -> std::optional<std::string>
+    {
         try
         {
-            if (support_list_status)
+            reset_response_parser();
+            parse_response(response);
+            if (mandatory_part_.empty() || mandatory_part_.front()->token_type != response_token_t::token_type_t::ATOM ||
+                !iequals(mandatory_part_.front()->atom, "STATUS"))
             {
-                string cmd = "LIST \"\" " + to_astring(mb) + " RETURN (STATUS (messages uidnext uidvalidity";
-                if (support_condstore)
-                    cmd += " highestmodseq";
-                cmd += "))";
-                dlg_->send(format(cmd));
+                reset_response_parser();
+                return std::nullopt;
+            }
 
-                bool has_more = true;
-                bool saw_any = false;
-                while (has_more)
-                {
-                    string line = dlg_->receive();
-                    auto parsed_line = parse_tag_result(line);
-                    if (parsed_line.tag == UNTAGGED_RESPONSE)
-                    {
-                        saw_any = true;
-                        // Best-effort parse: look for STATUS list and extract pairs.
-                        try
-                        {
-                            reset_response_parser();
-                            parse_response(parsed_line.response);
-                            // Search any LIST containing STATUS values.
-                            auto scan = [&](const std::list<std::shared_ptr<response_token_t>>& lst){
-                                for (const auto &tok : lst)
-                                {
-                                    if (tok->token_type == response_token_t::token_type_t::LIST)
-                                    {
-                                        bool key_found = false; string key;
-                                        for (const auto &sub : tok->parenthesized_list)
-                                        {
-                                            if (!key_found) { key = sub->atom; key_found = true; }
-                                            else {
-                                                const string &value = sub->atom;
-                                                if (iequals(key, "MESSAGES")) stat.messages_no = stoul(value);
-                                                else if (iequals(key, "UIDNEXT")) stat.uid_next = stoul(value);
-                                                else if (iequals(key, "UIDVALIDITY")) stat.uid_validity = stoul(value);
-                                                else if (iequals(key, "HIGHESTMODSEQ")) stat.highest_modseq = std::stoull(value);
-                                                key_found = false;
-                                            }
-                                        }
-                                    }
-                                }
-                            };
-                            scan(mandatory_part_);
-                            scan(optional_part_);
-                            reset_response_parser();
-                        }
-                        catch (...)
-                        {
-                            reset_response_parser();
-                        }
-                    }
-                    else if (parsed_line.tag == to_string(tag_))
-                    {
-                        if (!parsed_line.result.has_value() || parsed_line.result.value() != tag_result_response_t::OK)
-                            throw imap_error("LIST-STATUS failure.", parsed_line.response);
-                        has_more = false;
-                    }
-                }
-                if (!saw_any)
-                    stat.not_exist = true;
-            }
-            else
+            mandatory_part_.pop_front();
+            if (mandatory_part_.empty() || mandatory_part_.front()->token_type != response_token_t::token_type_t::ATOM)
             {
-                unsigned int flags = mailbox_stat_t::UID_NEXT 
-                    | mailbox_stat_t::UID_VALIDITY 
-                    | mailbox_stat_t::HIGHEST_MODSEQ;
-                stat = statistics(mb, flags);
-                stat.mailbox_name = mb;
+                reset_response_parser();
+                return std::nullopt;
             }
+
+            const std::string mailbox = normalize_mailbox(mandatory_part_.front()->atom);
+            auto& stat = stats_by_name[mailbox];
+            stat.mailbox_name = mailbox;
+            scan_token_tree(scan_token_tree, stat, mandatory_part_);
+            scan_token_tree(scan_token_tree, stat, optional_part_);
+            reset_response_parser();
+            return mailbox;
         }
         catch (...)
         {
-            stat.not_exist = true;
             reset_response_parser();
+            return std::nullopt;
         }
-        out.push_back(stat);
+    };
+
+    // LIST-STATUS path (if supported): use a single LIST ... RETURN (STATUS ...) and filter client-side.
+    if (support_list_status)
+    {
+        std::unordered_map<std::string, mailbox_stat_t> stats_by_name;
+        stats_by_name.reserve(mailboxes.size());
+
+        std::string cmd = "LIST \"\" * RETURN (STATUS (messages uidnext uidvalidity";
+        if (support_condstore)
+            cmd += " highestmodseq";
+        cmd += "))";
+
+        const unsigned tag_no = tag_ + 1;
+        dlg_->send(format(cmd));
+
+        bool has_more = true;
+        bool tagged_ok = false;
+        while (has_more)
+        {
+            std::string line = dlg_->receive();
+            auto parsed_line = parse_tag_result(line);
+            if (parsed_line.tag == UNTAGGED_RESPONSE)
+            {
+                // Some servers (e.g., Gmail) reply with separate untagged STATUS lines after LIST.
+                // Prefer parsing STATUS lines directly.
+                if (parse_untagged_status(parsed_line.response, stats_by_name).has_value())
+                    continue;
+
+                // Expect LIST responses which may embed STATUS lists (LIST-STATUS).
+                try
+                {
+                    reset_response_parser();
+                    parse_response(parsed_line.response);
+
+                    // Extract mailbox name from: LIST <attr-list> <delim> <mailbox> ...
+                    std::string mailbox;
+                    auto it = mandatory_part_.begin();
+                    for (; it != mandatory_part_.end(); ++it)
+                    {
+                        if ((*it)->token_type == response_token_t::token_type_t::ATOM && iequals((*it)->atom, "LIST"))
+                            break;
+                    }
+                    if (it != mandatory_part_.end())
+                    {
+                        ++it; // after LIST
+                        if (it != mandatory_part_.end() && (*it)->token_type == response_token_t::token_type_t::LIST)
+                            ++it; // attributes
+                        if (it != mandatory_part_.end() && (*it)->token_type == response_token_t::token_type_t::ATOM)
+                            ++it; // delimiter
+                        if (it != mandatory_part_.end() && (*it)->token_type == response_token_t::token_type_t::ATOM)
+                            mailbox = normalize_mailbox((*it)->atom);
+                    }
+
+                    if (!mailbox.empty())
+                    {
+                        auto& stat = stats_by_name[mailbox];
+                        stat.mailbox_name = mailbox;
+                        // LIST-STATUS nests STATUS inside a list; recurse to find (STATUS (...)) anywhere.
+                        scan_token_tree(scan_token_tree, stat, mandatory_part_);
+                        scan_token_tree(scan_token_tree, stat, optional_part_);
+                    }
+
+                    reset_response_parser();
+                }
+                catch (...)
+                {
+                    reset_response_parser();
+                }
+            }
+            else if (parsed_line.tag == to_string(tag_no))
+            {
+                tagged_ok = parsed_line.result.has_value() && parsed_line.result.value() == tag_result_response_t::OK;
+                has_more = false;
+            }
+            else
+            {
+                // Ignore unsolicited responses.
+                continue;
+            }
+        }
+
+        if (tagged_ok)
+        {
+            // Preserve order and always emit one stat per requested mailbox.
+            // If exact match is missing, try case-insensitive match as a fallback.
+            std::unordered_map<std::string, std::string> lower_to_key;
+            lower_to_key.reserve(stats_by_name.size());
+            for (const auto& kv : stats_by_name)
+            {
+                std::string lower = boost::to_lower_copy(kv.first);
+                if (lower_to_key.find(lower) == lower_to_key.end())
+                    lower_to_key.emplace(std::move(lower), kv.first);
+            }
+
+            for (const auto& mb : mailboxes)
+            {
+                mailbox_stat_t stat;
+                stat.mailbox_name = mb;
+                auto it = stats_by_name.find(normalize_mailbox(mb));
+                if (it == stats_by_name.end())
+                {
+                    auto lt = lower_to_key.find(boost::to_lower_copy(mb));
+                    if (lt != lower_to_key.end())
+                        it = stats_by_name.find(lt->second);
+                }
+
+                if (it != stats_by_name.end())
+                {
+                    stat = it->second;
+                    stat.mailbox_name = mb;
+                }
+                else
+                {
+                    stat.not_exist = true;
+                }
+
+                out.push_back(std::move(stat));
+            }
+            reset_response_parser();
+            return out;
+        }
+
+        // If LIST-STATUS path failed (non-OK), fall through to the STATUS fallback.
+        reset_response_parser();
     }
 
+    // Fallback path (no LIST-STATUS, e.g., Gmail/Outlook): pipeline STATUS commands in small batches.
+    // This avoids RTT-per-mailbox latency and adds capped adaptive throttling to reduce rate-limit risk.
+    {
+        std::unordered_map<std::string, mailbox_stat_t> stats_by_name;
+        stats_by_name.reserve(mailboxes.size());
+        std::unordered_set<std::string> not_exist;
+        not_exist.reserve(mailboxes.size());
+
+        // Throttle policy: enforce a minimum batch wall time by inserting sleeps when the server is very fast.
+        // Cap the total added delay so "~100 mailboxes" stays in the seconds range; beyond that, callers
+        // should implement higher-level pacing if they need it.
+        const std::size_t batch_size = 10;
+        const auto min_batch_duration = milliseconds(250);
+        auto sleep_budget = milliseconds(static_cast<long long>(std::min<std::size_t>(2500, mailboxes.size() * 25))); // <= ~2.5s extra
+
+        std::size_t i = 0;
+        while (i < mailboxes.size())
+        {
+            const std::size_t end = std::min(mailboxes.size(), i + batch_size);
+            const auto batch_start = steady_clock::now();
+
+            std::unordered_set<unsigned long> pending_tags;
+            pending_tags.reserve(end - i);
+            std::unordered_map<unsigned long, std::string> tag_to_mailbox;
+            tag_to_mailbox.reserve(end - i);
+            std::unordered_set<std::string> saw_status_mailbox;
+            saw_status_mailbox.reserve(end - i);
+
+            for (std::size_t j = i; j < end; ++j)
+            {
+                const std::string& mb = mailboxes[j];
+                const std::string mb_norm = normalize_mailbox(mb);
+                std::string cmd = "STATUS " + to_astring(mb) + " (messages uidnext uidvalidity";
+                if (support_condstore)
+                    cmd += " highestmodseq";
+                cmd += ")";
+
+                const unsigned long tag_no = static_cast<unsigned long>(tag_ + 1);
+                dlg_->send(format(cmd));
+                pending_tags.insert(tag_no);
+                tag_to_mailbox.emplace(tag_no, mb_norm);
+            }
+
+            while (!pending_tags.empty())
+            {
+                std::string line = dlg_->receive();
+                auto parsed_line = parse_tag_result(line);
+
+                if (parsed_line.tag == UNTAGGED_RESPONSE)
+                {
+                    auto mb = parse_untagged_status(parsed_line.response, stats_by_name);
+                    if (mb.has_value())
+                        saw_status_mailbox.insert(mb.value());
+                    continue;
+                }
+
+                // Tagged completion.
+                unsigned long tag_val = 0;
+                try
+                {
+                    tag_val = stoul(parsed_line.tag);
+                }
+                catch (...)
+                {
+                    continue; // unrelated tagged response
+                }
+
+                auto pt = pending_tags.find(tag_val);
+                if (pt == pending_tags.end())
+                    continue; // unrelated tagged response
+
+                const auto mb_it = tag_to_mailbox.find(tag_val);
+                const std::string mb = (mb_it != tag_to_mailbox.end()) ? mb_it->second : std::string{};
+
+                if (!parsed_line.result.has_value() || parsed_line.result.value() != tag_result_response_t::OK)
+                {
+                    if (!mb.empty())
+                        not_exist.insert(mb);
+                }
+                else
+                {
+                    // STATUS should have produced an untagged STATUS line; if it didn't, treat as inaccessible.
+                    if (!mb.empty() && saw_status_mailbox.find(mb) == saw_status_mailbox.end())
+                        not_exist.insert(mb);
+                }
+
+                pending_tags.erase(pt);
+            }
+
+            const auto elapsed = duration_cast<milliseconds>(steady_clock::now() - batch_start);
+            if (elapsed < min_batch_duration && sleep_budget.count() > 0)
+            {
+                auto sleep_for = std::min(min_batch_duration - elapsed, sleep_budget);
+                if (sleep_for.count() > 0)
+                {
+                    std::this_thread::sleep_for(sleep_for);
+                    sleep_budget -= sleep_for;
+                }
+            }
+
+            i = end;
+        }
+
+        // Materialize output in input order.
+        for (const auto& mb : mailboxes)
+        {
+            mailbox_stat_t stat;
+            stat.mailbox_name = mb;
+            const auto mb_norm = normalize_mailbox(mb);
+            if (not_exist.find(mb_norm) != not_exist.end())
+            {
+                stat.not_exist = true;
+            }
+            else
+            {
+                auto it = stats_by_name.find(mb_norm);
+                if (it != stats_by_name.end())
+                {
+                    stat = it->second;
+                    stat.mailbox_name = mb;
+                }
+                else
+                {
+                    stat.not_exist = true;
+                }
+            }
+            out.push_back(std::move(stat));
+        }
+    }
+
+    reset_response_parser();
     return out;
 }
 
@@ -1556,6 +1848,150 @@ auto imap::changed_since(unsigned long long mod_seq) -> changed_since_result_t
         result.vanished_uids.erase(std::unique(result.vanished_uids.begin(), result.vanished_uids.end()), result.vanished_uids.end());
     }
     return result;
+}
+
+
+std::vector<std::string> imap::fetch_changed_gmail_labels(unsigned long long last_modseq)
+{
+    // CHANGEDSINCE is defined by RFC 7162 (CONDSTORE/QRESYNC). Gmail exposes a global MODSEQ.
+    // Require server support for CHANGEDSINCE and Gmail's X-GM-EXT-1 extension.
+    const auto &caps = capabilities();
+    const auto has_cap = [&](const std::string &cap) {
+        return std::find_if(caps.begin(), caps.end(), [&](const std::string &c){ return boost::iequals(c, cap); }) != caps.end();
+    };
+    if (!has_cap("CONDSTORE") && !has_cap("QRESYNC"))
+        throw imap_error("Server does not support CONDSTORE/QRESYNC.", "");
+    if (!has_cap("X-GM-EXT-1"))
+        throw imap_error("Server does not support Gmail X-GM-EXT-1 (X-GM-LABELS).", "");
+
+    // Execute exactly the Gmail-specific command requested by the caller.
+    std::string cmd = "UID FETCH 1:* (X-GM-LABELS) (CHANGEDSINCE " + std::to_string(last_modseq) + ")";
+    dlg_->send(format(cmd));
+
+    std::vector<std::string> labels;
+    std::unordered_set<std::string> seen;
+    bool has_more = true;
+
+    auto add_label = [&](const std::shared_ptr<response_token_t>& tok)
+    {
+        if (!tok)
+            return;
+
+        std::string s;
+        if (tok->token_type == response_token_t::token_type_t::ATOM)
+            s = tok->atom;
+        else if (tok->token_type == response_token_t::token_type_t::LITERAL)
+            s = tok->literal;
+        else
+            return;
+
+        boost::trim(s);
+        if (s.empty())
+            return;
+
+        if (seen.insert(s).second)
+            labels.push_back(std::move(s));
+    };
+
+    try
+    {
+        while (has_more)
+        {
+            reset_response_parser();
+            std::string line = dlg_->receive();
+            tag_result_response_t parsed_line = parse_tag_result(line);
+
+            if (parsed_line.tag == UNTAGGED_RESPONSE)
+            {
+                parse_response(parsed_line.response);
+
+                // Ignore unrelated untagged responses (EXISTS/RECENT/OK/CAPABILITY/etc.).
+                if (mandatory_part_.empty() || mandatory_part_.front()->token_type != response_token_t::token_type_t::ATOM)
+                    continue;
+
+                // Best-effort: ignore VANISHED responses (QRESYNC).
+                if (iequals(mandatory_part_.front()->atom, "VANISHED"))
+                    continue;
+
+                // Expect: * <seq> FETCH (...)
+                try
+                {
+                    (void)std::stoul(mandatory_part_.front()->atom);
+                }
+                catch (...)
+                {
+                    continue;
+                }
+                mandatory_part_.pop_front();
+
+                if (mandatory_part_.empty() || mandatory_part_.front()->token_type != response_token_t::token_type_t::ATOM ||
+                    !iequals(mandatory_part_.front()->atom, "FETCH"))
+                    continue;
+
+                // Find the FETCH attribute list.
+                std::shared_ptr<response_token_t> fetch_list_token = nullptr;
+                for (const auto& part : mandatory_part_)
+                {
+                    if (part && part->token_type == response_token_t::token_type_t::LIST)
+                    {
+                        fetch_list_token = part;
+                        break;
+                    }
+                }
+                if (!fetch_list_token)
+                    continue;
+
+                // Scan list for X-GM-LABELS.
+                const auto& lst = fetch_list_token->parenthesized_list;
+                for (auto it = lst.begin(); it != lst.end(); ++it)
+                {
+                    const auto& key = *it;
+                    if (!key || key->token_type != response_token_t::token_type_t::ATOM)
+                        continue;
+                    if (!iequals(key->atom, "X-GM-LABELS"))
+                        continue;
+
+                    auto nx = it;
+                    ++nx;
+                    if (nx == lst.end() || !*nx)
+                        break;
+
+                    const auto& val = *nx;
+                    if (val->token_type == response_token_t::token_type_t::LIST)
+                    {
+                        for (const auto& lab : val->parenthesized_list)
+                            add_label(lab);
+                    }
+                    else
+                    {
+                        // Be permissive if server returns a non-list value.
+                        add_label(val);
+                    }
+                }
+            }
+            else if (parsed_line.tag == to_string(tag_))
+            {
+                if (!parsed_line.result.has_value() || parsed_line.result.value() != tag_result_response_t::OK)
+                    throw imap_error("Gmail label CHANGEDSINCE failure.", "Response=`" + parsed_line.response + "`.");
+                has_more = false;
+            }
+            else
+            {
+                throw imap_error("Parsing failure.", "Tag=`" + parsed_line.tag + "`.");
+            }
+        }
+    }
+    catch (const invalid_argument& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+    catch (const out_of_range& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+
+    reset_response_parser();
+    return labels;
 }
 
 

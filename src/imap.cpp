@@ -40,7 +40,6 @@ using std::make_optional;
 using std::make_shared;
 using std::make_tuple;
 using std::map;
-using std::move;
 using std::out_of_range;
 using std::pair;
 using std::shared_ptr;
@@ -587,7 +586,7 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                 else
                     throw;
             }
-            found_messages.emplace(ms.first, move(msg));
+            found_messages.emplace(ms.first, std::move(msg));
         }
     };
     
@@ -770,7 +769,7 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                         continue;
                     }
                     // Capture the raw RFC 822 bytes of the message.
-                    string raw = move(literal_token->literal);
+                    string raw = std::move(literal_token->literal);
                     // Compute a SHA-256 dedupe hash of the raw content, if openssl is available.
                     string dedupe_hash{};
 #if defined(MAILIO_HAVE_OPENSSL)
@@ -817,11 +816,11 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
                     msg_str.emplace(
                         is_uids ? uid_no : sequence_no,
                         make_tuple(
-                            move(raw),
+                            std::move(raw),
                             uid_no,
                             sequence_no,
-                            move(dedupe_hash),
-                            move(message_flags)
+                            std::move(dedupe_hash),
+                            std::move(message_flags)
                         )
                     );
                     
@@ -2110,6 +2109,442 @@ void imap::remove(unsigned long message_no, bool is_uid)
     }
 }
 
+std::map<unsigned long, unsigned long> imap::move(const std::vector<unsigned long>& uids, const std::string& to_mailbox)
+{
+    if (uids.empty())
+        return {};
+
+    auto build_uid_set = [&](const std::vector<unsigned long>& in) -> std::string
+    {
+        std::vector<unsigned long> v;
+        v.reserve(in.size());
+        for (auto u : in)
+            if (u != 0)
+                v.push_back(u);
+        if (v.empty())
+            return std::string{};
+
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+
+        std::string out;
+        out.reserve(v.size() * 3);
+
+        bool first = true;
+        std::size_t i = 0;
+        while (i < v.size())
+        {
+            unsigned long start = v[i];
+            unsigned long end = start;
+            while (i + 1 < v.size() && v[i + 1] == end + 1)
+            {
+                ++i;
+                end = v[i];
+            }
+
+            if (!first)
+                out += LIST_SEPARATOR;
+            first = false;
+
+            out += to_string(start);
+            if (end != start)
+            {
+                out += RANGE_SEPARATOR;
+                out += to_string(end);
+            }
+            ++i;
+        }
+        return out;
+    };
+
+    const std::string uid_set = build_uid_set(uids);
+    if (uid_set.empty())
+        return {};
+
+    const auto& caps = capabilities();
+    auto has_cap = [&](const std::string& cap) {
+        return std::find_if(caps.begin(), caps.end(), [&](const std::string& c){ return boost::iequals(c, cap); }) != caps.end();
+    };
+    const bool support_move = has_cap("MOVE");
+    const bool support_uidplus = has_cap("UIDPLUS");
+
+    std::map<unsigned long, unsigned long> uid_map;
+
+    auto parse_uid_set = [&](const std::string& uidset) -> std::vector<unsigned long>
+    {
+        std::vector<unsigned long> out;
+        std::vector<std::string> parts;
+        boost::split(parts, uidset, boost::is_any_of(LIST_SEPARATOR));
+        for (auto p : parts)
+        {
+            boost::trim(p);
+            if (p.empty() || p == RANGE_ALL)
+                continue;
+
+            auto colon = p.find(RANGE_SEPARATOR);
+            if (colon == std::string::npos)
+            {
+                out.push_back(std::stoul(p));
+                continue;
+            }
+
+            auto a = p.substr(0, colon);
+            auto b = p.substr(colon + 1);
+            boost::trim(a);
+            boost::trim(b);
+            if (a.empty() || b.empty() || a == RANGE_ALL || b == RANGE_ALL)
+                continue;
+
+            unsigned long start = std::stoul(a);
+            unsigned long end = std::stoul(b);
+            if (end < start)
+                std::swap(start, end);
+
+            // Best-effort guard against pathological ranges.
+            const unsigned long long span = static_cast<unsigned long long>(end) - static_cast<unsigned long long>(start);
+            if (span > 200000ULL)
+                return std::vector<unsigned long>{};
+
+            for (unsigned long v = start; v <= end; ++v)
+            {
+                out.push_back(v);
+                if (v == std::numeric_limits<unsigned long>::max())
+                    break;
+            }
+        }
+        return out;
+    };
+
+    auto try_parse_copyuid = [&](const std::string& response) -> void
+    {
+        if (!support_uidplus)
+            return;
+        if (!uid_map.empty())
+            return;
+
+        // Look for a bracketed response code like: [COPYUID <uidvalidity> <src-set> <dst-set>]
+        const std::string lower = boost::algorithm::to_lower_copy(response);
+        auto pos = lower.find("copyuid");
+        if (pos == std::string::npos)
+            return;
+
+        // Try to capture the surrounding bracket segment.
+        std::size_t lbr = response.rfind('[', pos);
+        if (lbr == std::string::npos)
+            lbr = pos;
+        std::size_t rbr = response.find(']', pos);
+        if (rbr == std::string::npos)
+            rbr = response.size();
+
+        std::string seg = response.substr(lbr, rbr - lbr);
+        // Remove '[' if present.
+        if (!seg.empty() && seg.front() == '[')
+            seg.erase(seg.begin());
+        boost::trim(seg);
+
+        std::vector<std::string> toks;
+        boost::split(toks, seg, boost::is_any_of(" \t\r\n"), boost::token_compress_on);
+        if (toks.size() < 4)
+            return;
+
+        std::size_t i = 0;
+        for (; i < toks.size(); ++i)
+            if (boost::iequals(toks[i], "COPYUID"))
+                break;
+        if (i == toks.size() || i + 3 >= toks.size())
+            return;
+
+        // toks[i+1] is uidvalidity (ignored for mapping).
+        const std::string& src_set = toks[i + 2];
+        const std::string& dst_set = toks[i + 3];
+
+        auto src = parse_uid_set(src_set);
+        auto dst = parse_uid_set(dst_set);
+        if (src.empty() || dst.empty() || src.size() != dst.size())
+            return;
+
+        for (std::size_t k = 0; k < src.size(); ++k)
+            uid_map[src[k]] = dst[k];
+    };
+
+    auto wait_tagged_ok = [&]() {
+        bool has_more = true;
+        while (has_more)
+        {
+            reset_response_parser();
+            std::string line = dlg_->receive();
+            tag_result_response_t parsed_line = parse_tag_result(line);
+
+            if (parsed_line.tag == UNTAGGED_RESPONSE)
+            {
+                // Best-effort: parse and ignore untagged responses (COPYUID, EXPUNGE, EXISTS, etc.).
+                try
+                {
+                    parse_response(parsed_line.response);
+                }
+                catch (...)
+                {
+                    reset_response_parser();
+                }
+                continue;
+            }
+            else if (parsed_line.tag == to_string(tag_))
+            {
+                if (!parsed_line.result.has_value() || parsed_line.result.value() != tag_result_response_t::OK)
+                    throw imap_error("Moving message failure.", "Response=`" + parsed_line.response + "`.");
+
+                // Best-effort: capture COPYUID mapping if present.
+                try_parse_copyuid(parsed_line.response);
+
+                has_more = false;
+            }
+            else
+            {
+                // Ignore unrelated tagged responses.
+                continue;
+            }
+        }
+    };
+
+    try
+    {
+        if (support_move)
+        {
+            // Prefer server-side MOVE (RFC 6851).
+            std::string cmd = "UID MOVE " + uid_set + TOKEN_SEPARATOR_STR + to_astring(to_mailbox);
+            dlg_->send(format(cmd));
+            wait_tagged_ok();
+        }
+        else
+        {
+            // Fallback: COPY to destination, then delete/expunge from source.
+            {
+                std::string cmd = "UID COPY " + uid_set + TOKEN_SEPARATOR_STR + to_astring(to_mailbox);
+                dlg_->send(format(cmd));
+                wait_tagged_ok();
+            }
+
+            // Mark deleted in source.
+            uid_store_flags(uids, std::vector<std::string>{"\\Deleted"}, true);
+
+            // Expunge only these messages if possible; otherwise expunge all deleted.
+            if (support_uidplus)
+            {
+                std::string cmd = "UID EXPUNGE " + uid_set;
+                dlg_->send(format(cmd));
+                wait_tagged_ok();
+            }
+            else
+            {
+                dlg_->send(format("EXPUNGE"));
+                wait_tagged_ok();
+            }
+        }
+    }
+    catch (const std::invalid_argument& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+    catch (const std::out_of_range& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+
+    reset_response_parser();
+
+    return uid_map;
+}
+
+void imap::uid_store_flags(unsigned long uid, const std::vector<std::string>& flags, bool add)
+{
+    if (flags.empty())
+        return;
+
+    // Build UID STORE command. Use .SILENT to reduce server responses / bandwidth.
+    // Flags are expected to be IMAP atoms like "\\Seen".
+    std::string cmd = "UID STORE " + to_string(uid) + (add ? " +FLAGS.SILENT (" : " -FLAGS.SILENT (");
+    for (std::size_t i = 0; i < flags.size(); ++i)
+    {
+        if (i)
+            cmd += TOKEN_SEPARATOR_STR;
+        cmd += flags[i];
+    }
+    cmd += ")";
+
+    dlg_->send(format(cmd));
+
+    bool has_more = true;
+    try
+    {
+        while (has_more)
+        {
+            reset_response_parser();
+            std::string line = dlg_->receive();
+            tag_result_response_t parsed_line = parse_tag_result(line);
+
+            if (parsed_line.tag == UNTAGGED_RESPONSE)
+            {
+                // Best-effort: ignore any untagged FETCH/FLAGS payloads.
+                try
+                {
+                    parse_response(parsed_line.response);
+                }
+                catch (...)
+                {
+                    reset_response_parser();
+                    continue;
+                }
+            }
+            else if (parsed_line.tag == to_string(tag_))
+            {
+                if (!parsed_line.result.has_value() || parsed_line.result.value() != tag_result_response_t::OK)
+                    throw imap_error("STORE failure.", "Response=`" + parsed_line.response + "`.");
+                has_more = false;
+            }
+            else
+            {
+                throw imap_error("Incorrect tag parsed.", "Tag=`" + parsed_line.tag + "`.");
+            }
+        }
+    }
+    catch (const std::invalid_argument& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+    catch (const std::out_of_range& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+
+    reset_response_parser();
+}
+
+void imap::uid_store_flags(const std::vector<unsigned long>& uids, const std::vector<std::string>& flags, bool add)
+{
+    if (uids.empty() || flags.empty())
+        return;
+
+    if (uids.size() == 1)
+    {
+        uid_store_flags(uids.front(), flags, add);
+        return;
+    }
+
+    auto build_uid_set = [&](const std::vector<unsigned long>& in) -> std::string
+    {
+        std::vector<unsigned long> v;
+        v.reserve(in.size());
+        for (auto u : in)
+            if (u != 0)
+                v.push_back(u);
+        if (v.empty())
+            return std::string{};
+
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+
+        std::string out;
+        out.reserve(v.size() * 3);
+
+        bool first = true;
+        std::size_t i = 0;
+        while (i < v.size())
+        {
+            unsigned long start = v[i];
+            unsigned long end = start;
+            while (i + 1 < v.size() && v[i + 1] == end + 1)
+            {
+                ++i;
+                end = v[i];
+            }
+
+            if (!first)
+                out += LIST_SEPARATOR;
+            first = false;
+
+            out += to_string(start);
+            if (end != start)
+            {
+                out += RANGE_SEPARATOR;
+                out += to_string(end);
+            }
+            ++i;
+        }
+        return out;
+    };
+
+    const std::string uid_set = build_uid_set(uids);
+    if (uid_set.empty())
+        return;
+
+    std::string cmd = "UID STORE " + uid_set + (add ? " +FLAGS.SILENT (" : " -FLAGS.SILENT (");
+    for (std::size_t i = 0; i < flags.size(); ++i)
+    {
+        if (i)
+            cmd += TOKEN_SEPARATOR_STR;
+        cmd += flags[i];
+    }
+    cmd += ")";
+
+    dlg_->send(format(cmd));
+
+    bool has_more = true;
+    try
+    {
+        while (has_more)
+        {
+            reset_response_parser();
+            std::string line = dlg_->receive();
+            tag_result_response_t parsed_line = parse_tag_result(line);
+
+            if (parsed_line.tag == UNTAGGED_RESPONSE)
+            {
+                // With .SILENT the server should not send untagged FETCH responses,
+                // but be lenient and ignore any that do appear.
+                try
+                {
+                    parse_response(parsed_line.response);
+                }
+                catch (...)
+                {
+                    reset_response_parser();
+                    continue;
+                }
+            }
+            else if (parsed_line.tag == to_string(tag_))
+            {
+                if (!parsed_line.result.has_value() || parsed_line.result.value() != tag_result_response_t::OK)
+                    throw imap_error("STORE failure.", "Response=`" + parsed_line.response + "`.");
+                has_more = false;
+            }
+            else
+            {
+                throw imap_error("Incorrect tag parsed.", "Tag=`" + parsed_line.tag + "`.");
+            }
+        }
+    }
+    catch (const std::invalid_argument& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+    catch (const std::out_of_range& exc)
+    {
+        throw imap_error("Parsing failure.", exc.what());
+    }
+
+    reset_response_parser();
+}
+
+void imap::uid_set_flag(const std::vector<unsigned long>& uids, const std::string& flag, bool add)
+{
+    uid_store_flags(uids, std::vector<std::string>{flag}, add);
+}
+
+void imap::uid_set_flag(unsigned long uid, const std::string& flag, bool add)
+{
+    uid_store_flags(uid, std::vector<std::string>{flag}, add);
+}
+
 
 void imap::search(const list<imap::search_condition_t>& conditions, list<unsigned long>& results, bool want_uids)
 {
@@ -2359,7 +2794,7 @@ auto imap::list_special_use(bool only_special) -> special_use_map_t
                         }
 
                         if (!special_attrs.empty() || !only_special)
-                            result[mailbox_name] = move(special_attrs);
+                            result[mailbox_name] = std::move(special_attrs);
                     }
                     catch (...)
                     {

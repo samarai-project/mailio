@@ -611,6 +611,88 @@ public:
     void remove(unsigned long message_no, bool is_uid = false);
 
     /**
+    Move messages (by UID) from the currently selected mailbox to another.
+
+    The method assumes the source mailbox is already selected and attempts to move the given
+    message UIDs into `to_mailbox`.
+
+    - If the server advertises the `MOVE` capability (RFC 6851), it issues `UID MOVE`.
+    - Otherwise it falls back to `UID COPY` + `UID STORE ... +FLAGS.SILENT (\Deleted)` and
+        then expunges (prefer `UID EXPUNGE` when `UIDPLUS` is available, otherwise `EXPUNGE`).
+
+        Return value:
+        - If the server provides a `COPYUID` response code (typically via the `UIDPLUS` capability),
+            the method returns a mapping from source UID to destination UID.
+        - If no such mapping is available (server does not support it or does not include it in
+            the response), the method returns an empty map.
+
+        Notes:
+    - UIDs are interpreted within the currently selected mailbox (the source).
+    - When falling back to plain `EXPUNGE`, the server may permanently remove other messages
+        already marked `\Deleted` in the selected mailbox.
+
+    @param uids         Vector of message UIDs to move.
+        @param to_mailbox   Destination mailbox name.
+        @return             Best-effort mapping from source UID to destination UID.
+    @throw imap_error   On protocol/parse/server errors.
+    */
+        std::map<unsigned long, unsigned long> move(const std::vector<unsigned long> &uids, const std::string &to_mailbox);
+
+    /**
+    Store IMAP flags for a message identified by UID in the currently selected mailbox.
+
+    This issues a `UID STORE <uid> (+FLAGS| -FLAGS) (<flag1> <flag2> ...)` command and
+    waits for the tagged completion. The method does NOT select a mailbox; callers must
+    ensure a mailbox is already selected.
+
+    Use this when you need explicit control over server flags (for example, set/unset
+    `\Seen`) while minimizing extra server round-trips. The method operates on UIDs
+    to avoid sequence-number race conditions.
+
+    @param uid   Message UID to modify.
+    @param flags List of IMAP flag tokens (e.g. "\\Seen", "\\Flagged").
+    @param add   If true, adds the flags (``+FLAGS``). If false, removes the flags (``-FLAGS``).
+    @throw imap_error On protocol/parse/server errors.
+    */
+    void uid_store_flags(unsigned long uid, const std::vector<std::string>& flags, bool add = true);
+
+    /**
+    Convenience overload for a single flag token.
+
+    @param uid  Message UID to modify.
+    @param flag Single IMAP flag token (e.g. "\\Seen").
+    @param add  If true, adds the flag; if false, removes it.
+    @throw imap_error On protocol/parse/server errors.
+    */
+    void uid_set_flag(unsigned long uid, const std::string& flag, bool add = true);
+
+    /**
+    Store IMAP flags for multiple messages identified by UIDs in the currently selected mailbox.
+
+    This issues a single `UID STORE <uid-set> (+FLAGS| -FLAGS) (<flag1> <flag2> ...)` command
+    where `<uid-set>` is a compressed UID set (comma separated with ranges) built from
+    the provided `uids`. Callers must ensure a mailbox is already selected.
+
+    This is the most quota-friendly way to toggle read/unread for multiple messages.
+
+    @param uids  Vector of message UIDs to modify. Can contain one or many UIDs.
+    @param flags List of IMAP flag tokens (e.g. "\\Seen", "\\Flagged").
+    @param add   If true, adds the flags. If false, removes the flags.
+    @throw imap_error On protocol/parse/server errors.
+    */
+    void uid_store_flags(const std::vector<unsigned long>& uids, const std::vector<std::string>& flags, bool add = true);
+
+    /**
+    Convenience overload to set/unset a single flag on multiple UIDs.
+
+    @param uids Vector of message UIDs to modify.
+    @param flag Single IMAP flag token (e.g. "\\Seen").
+    @param add  If true, adds the flag; if false, removes it.
+    @throw imap_error On protocol/parse/server errors.
+    */
+    void uid_set_flag(const std::vector<unsigned long>& uids, const std::string& flag, bool add = true);
+
+    /**
     Searching a mailbox.
 
     The RFC 3501 section 6.4.4 does not specify whether another untagged response except the SEARCH can be obtained. However, there are IMAP servers which

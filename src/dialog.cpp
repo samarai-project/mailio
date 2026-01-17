@@ -15,6 +15,7 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <limits>
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <mailio/dialog.hpp>
@@ -69,6 +70,12 @@ void set_log_callback(log_callback_t cb)
     g_log_callback = std::move(cb);
 }
 
+bool is_log_callback_installed()
+{
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    return static_cast<bool>(g_log_callback);
+}
+
 void call_log_callback_or_fallback(const std::string& text)
 {
     // Copy the callback under lock, then call without holding the mutex.
@@ -86,12 +93,10 @@ void call_log_callback_or_fallback(const std::string& text)
     std::cout << "[MAILIO] [BUGFIX] " << text << "\n";
 }
 
-std::string b64_encode(const std::string& value)
+std::string b64_encode(const std::string& value, std::string::size_type line_policy)
 {
-    base64 b64(
-        static_cast<string::size_type>(codec::line_len_policy_t::RECOMMENDED),
-        static_cast<string::size_type>(codec::line_len_policy_t::RECOMMENDED)
-    );
+    // SASL initial responses (e.g., XOAUTH2) must not be line-wrapped. Use a large line policy to keep the encoded value on one line.
+    base64 b64(line_policy, line_policy);
     auto enc_v = b64.encode(value);
     std::stringstream res{};
     for (size_t i = 0; i < enc_v.size(); ++i)

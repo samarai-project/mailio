@@ -17,6 +17,7 @@ copy at http://www.freebsd.org/copyright/freebsd-license.html.
 #include <tuple>
 #include <algorithm>
 #include <cctype>
+#include <thread>
 #include <boost/asio/ip/host_name.hpp>
 #include <mailio/base64.hpp>
 #include <mailio/smtp.hpp>
@@ -66,6 +67,44 @@ smtp::~smtp()
     catch (...)
     {
     }
+}
+
+
+void smtp::disconnect(milliseconds timeout)
+{
+    if (!dlg_)
+        return;
+
+    // Request a graceful planned interrupt of in-flight I/O.
+    try { dlg_->request_planned_interrupt(); } catch (...) { }
+
+    // Optionally wait a short grace period for the current operation to unwind.
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (dlg_->is_in_wait() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+    // If still in wait after grace, perform hard abort.
+    if (dlg_->is_in_wait())
+        try { dlg_->abort_now(); } catch (...) { }
+
+    // Ensure socket/timers are closed regardless.
+    try { dlg_->close(); } catch (...) { }
+}
+
+
+void smtp::set_session_name(const std::string& name)
+{
+    // Store on the underlying dialog so low-level SEND/RECEIVE logs carry the label.
+    if (dlg_)
+        dlg_->set_session_name(name);
+}
+
+
+std::string smtp::session_name() const
+{
+    if (dlg_)
+        return dlg_->session_name();
+    return std::string();
 }
 
 
@@ -246,50 +285,81 @@ void smtp::auth_login_xoauth2(const std::string &username, const std::string &ac
     // XOAUTH2 SASL initial client response as per RFC 7628:
     // base64("user=" user "\x01auth=Bearer " access_token "\x01\x01")
     std::string sasl = "user=" + username + "\x01" + "auth=Bearer " + access_token + "\x01\x01";
-    std::string sasl_b64 = b64_encode(sasl);
+    std::string sasl_b64 = b64_encode(sasl, static_cast<string::size_type>(codec::line_len_policy_t::NONE));
 
-    // Send AUTH XOAUTH2 with the initial client response.
-    dlg_->send("AUTH XOAUTH2 " + sasl_b64);
-    string line = dlg_->receive();
-    tuple<int, bool, string> tokens = parse_line(line);
-
-    // Success path: server replies with 235 (2XX - positive completion)
-    if (positive_completion(std::get<0>(tokens)))
-        return;
-
-    auto code = std::get<0>(tokens);
-    auto error_b64 = std::get<2>(tokens);
-    int final_code{0};
-    std::string final_error_b64{};
-
-    // Some servers (e.g., Gmail on failure) respond with 334 and a base64 encoded JSON error.
-    if (positive_intermediate(std::get<0>(tokens)))
+    // Local sanity checks and helpful debug breadcrumbs.
+    auto has_crlf = (sasl.find('\r') != std::string::npos) || (sasl.find('\n') != std::string::npos);
+    auto has_other_ctrl = std::any_of(sasl.begin(), sasl.end(), [](unsigned char ch)
     {
-        
-        // Abort per RFC by sending an empty line – server should respond with final 5XX (e.g., 535).
-        try
+        return (ch < 0x20) && (ch != 0x01) && (ch != 0x09); // allow HT and the SASL \x01 separators
+    });
+
+    auto evaluate = [this](const tuple<int, bool, string>& tokens)
+    {
+        if (positive_completion(std::get<0>(tokens)))
+            return;
+
+        auto code = std::get<0>(tokens);
+        auto error_b64 = std::get<2>(tokens);
+        int final_code{0};
+        std::string final_error_b64{};
+
+        // Some servers (e.g., Gmail on failure) respond with 334 and a base64 encoded JSON error.
+        if (positive_intermediate(std::get<0>(tokens)))
         {
-            dlg_->send("");
-            line = dlg_->receive();
-            tokens = parse_line(line);
-            final_code = std::get<0>(tokens);
-            final_error_b64 = std::get<2>(tokens);
-        }
-        catch (...)
-        {
-            // ignore
+            // Abort per RFC by sending an empty line – server should respond with final 5XX (e.g., 535).
+            try
+            {
+                dlg_->send("");
+                auto line = dlg_->receive();
+                auto final_tokens = parse_line(line);
+                final_code = std::get<0>(final_tokens);
+                final_error_b64 = std::get<2>(final_tokens);
+            }
+            catch (...)
+            {
+                // ignore
+            }
         }
 
+        std::string details = std::string{"JSON={"}
+            + "\"code\": " + std::to_string(code) + ","
+            + "\"error\": \"" + error_b64 + "\","
+            + "\"finalCode\": " + std::to_string(final_code) + ","
+            + "\"final\": \"" + final_error_b64 + "\""
+            + "}";
+        throw smtp_error("Authentication rejection.", details);
+    };
+
+    // If the full command would exceed the RFC 5321 line length (512 incl. CRLF), fall back to a two-step SASL flow:
+    //   AUTH XOAUTH2\r\n
+    //   <334 prompt>\r\n
+    //   <base64 payload>\r\n
+    // This avoids server-side truncation of long access tokens.
+    const std::size_t smtp_line_limit = 500; // keep margin for CRLF and status text
+    const bool use_challenge_response = ("AUTH XOAUTH2 " + sasl_b64).size() > smtp_line_limit;
+
+    if (use_challenge_response)
+    {
+        dlg_->send("AUTH XOAUTH2");
+        auto line = dlg_->receive();
+        auto tokens = parse_line(line);
+        if (!positive_intermediate(std::get<0>(tokens)))
+            evaluate(tokens); // will throw
+
+        dlg_->send(sasl_b64);
+        line = dlg_->receive();
+        tokens = parse_line(line);
+        evaluate(tokens); // success returns, otherwise throws
     }
-
-    std::string details = std::string{"JSON={"} 
-        + "\"code\": " + std::to_string(code) + "," 
-        + "\"error\": \"" + error_b64 + "\"," 
-        + "\"finalCode\": " + std::to_string(final_code) + "," 
-        + "\"final\": \"" + final_error_b64 + "\"" 
-        + "}";
-        
-    throw smtp_error("Authentication rejection.", details);
+    else
+    {
+        // Send AUTH XOAUTH2 with the initial client response.
+        dlg_->send("AUTH XOAUTH2 " + sasl_b64);
+        auto line = dlg_->receive();
+        auto tokens = parse_line(line);
+        evaluate(tokens);
+    }
     
 }
 
@@ -420,6 +490,11 @@ string smtps::authenticate(const string& username, const string& password, auth_
     else if (method == auth_method_t::XOAUTH2)
     {
         is_start_tls_ = false;
+        greeting = smtp::authenticate(username, password, smtp::auth_method_t::XOAUTH2);
+    }
+    else if (method == auth_method_t::XOAUTH2_START_TLS)
+    {
+        is_start_tls_ = true;
         greeting = smtp::authenticate(username, password, smtp::auth_method_t::XOAUTH2);
     }
     return greeting;

@@ -39,6 +39,7 @@ Passing an empty/null callback clears the installed callback and restores
 the default behavior (log to std::cout with a simple prefix).
 */
 void set_log_callback(log_callback_t cb);
+bool is_log_callback_installed();
 
 // Internal helper implemented in dialog.cpp; do not use directly.
 void call_log_callback_or_fallback(const std::string& text);
@@ -68,7 +69,7 @@ inline void debug_bugfix(const std::string &session_name,
         debug_bugfix("<" + session_name + "> " + prefix + ": " + text);
 }
 
-std::string b64_encode(const std::string& value);
+std::string b64_encode(const std::string& value, std::string::size_type line_policy);
 
 /**
 Dealing with network in a line oriented fashion.

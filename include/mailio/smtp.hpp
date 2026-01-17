@@ -69,6 +69,35 @@ public:
     **/
     virtual ~smtp();
 
+    /**
+    Set a human-friendly name for this SMTP session.
+
+    The name is forwarded to the underlying network dialog so that
+    debug logs get prefixed with the session label. Useful when running
+    multiple concurrent sessions and diagnosing traffic.
+
+    Example: set_session_name("acc1");
+    Results in log lines like: [acc1] SEND: <cmd>
+
+    @param name  Arbitrary identifier; empty clears the name.
+    */
+    void set_session_name(const std::string& name);
+
+    /** Get the current SMTP session name (possibly empty). */
+    std::string session_name() const;
+
+    /**
+    Gracefully disconnect from the server within a bounded timeout.
+
+    Behavior:
+    - Request a planned interrupt of any in-flight network I/O.
+    - Wait up to the given timeout for the operation to unwind.
+    - If still blocked, abort pending I/O and close the socket so callers are not blocked during shutdown.
+
+    @param timeout Maximum time to spend attempting a graceful interrupt. Defaults to 200ms.
+    */
+    void disconnect(std::chrono::milliseconds timeout = std::chrono::milliseconds(200));
+
     smtp(const smtp&) = delete;
 
     smtp(smtp&&) = delete;
@@ -272,8 +301,9 @@ public:
       mechanism is allowed.
     - LOGIN: The username and password are sent in Base64 format.
     - START_TLS: For the TCP connection, a TLS negotiation is asked before sending the login parameters.
+    - XOAUTH2_START_TLS: XOAUTH2 over a plain TCP connection that is upgraded with STARTTLS before authenticating.
     **/
-    enum class auth_method_t {NONE, LOGIN, START_TLS, XOAUTH2};
+    enum class auth_method_t {NONE, LOGIN, START_TLS, XOAUTH2, XOAUTH2_START_TLS};
 
     /**
     Making a connection to the server.

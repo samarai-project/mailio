@@ -3300,7 +3300,7 @@ void imap::auth_login_xoauth2(const std::string &username, const std::string &ac
     // XOAUTH2 SASL initial client response as per RFC 7628 (and Google docs):
     // base64("user=" user "\x01auth=Bearer " access_token "\x01\x01")
     std::string sasl = "user=" + username + "\x01" + "auth=Bearer " + access_token + "\x01\x01";
-    std::string sasl_b64 = b64_encode(sasl);
+    std::string sasl_b64 = b64_encode(sasl, static_cast<string::size_type>(codec::line_len_policy_t::RECOMMENDED));
     // IMAP requires a tagged command: AUTHENTICATE XOAUTH2 <base64>
     // (Unlike SMTP which may negotiate with numeric codes.)
     dlg_->send(format("AUTHENTICATE XOAUTH2 " + sasl_b64));

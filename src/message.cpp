@@ -1810,28 +1810,155 @@ mailboxes message::parse_address_list(const string& address_list)
 /*
 See [rfc 5322, section 3.3, page 14-16].
 */
+// local_date_time message::parse_date(const string& date_str) const
+// {
+//     try
+//     {
+//         // date format to be parsed is like "Thu, 17 Jul 2014 10:31:49 +0200 (CET)"
+//         regex r(R"(([A-Za-z]{3}[\ \t]*,)[\ \t]+(\d{1,2}[\ \t]+[A-Za-z]{3}[\ \t]+\d{4})[\ \t]+(\d{2}:\d{2}:\d{2}[\ \t]+(\+|\-)\d{4}).*)");
+//         smatch m;
+//         if (regex_match(date_str, m, r))
+//         {
+//             // TODO: regex manipulation to be replaced with time facet format?
+
+//             // if day has single digit, then prepend it with zero
+//             string dttz = m[1].str() + " " + (m[2].str()[1] == ' ' ? "0" : "") + m[2].str() + " " + m[3].str().substr(0, 12) + ":" + m[3].str().substr(12);
+//             stringstream ss(dttz);
+//             local_time_input_facet* facet = new local_time_input_facet("%a %d %b %Y %H:%M:%S %ZP");
+//             ss.exceptions(std::ios_base::failbit);
+//             ss.imbue(locale(ss.getloc(), facet));
+//             local_date_time ldt(not_a_date_time);
+//             ss >> ldt;
+//             return ldt;
+//         }
+//         return local_date_time(not_a_date_time);
+//     }
+//     catch (...)
+//     {
+//         throw message_error("Date parsing error.", "Date is `" + date_str + "`.");
+//     }
+// }
+
+
 local_date_time message::parse_date(const string& date_str) const
 {
     try
     {
-        // date format to be parsed is like "Thu, 17 Jul 2014 10:31:49 +0200 (CET)"
-        regex r(R"(([A-Za-z]{3}[\ \t]*,)[\ \t]+(\d{1,2}[\ \t]+[A-Za-z]{3}[\ \t]+\d{4})[\ \t]+(\d{2}:\d{2}:\d{2}[\ \t]+(\+|\-)\d{4}).*)");
-        smatch m;
-        if (regex_match(date_str, m, r))
-        {
-            // TODO: regex manipulation to be replaced with time facet format?
+        // RFC 5322 allows numeric zones (+HHMM/-HHMM) and obsolete named zones (e.g. GMT, UT, EST/EDT, ...).
+        // Examples:
+        //   Tue, 20 Jan 2026 15:01:38 +0000
+        //   Sat, 10 Jan 2026 15:04:20 GMT
+        //
+        // Best-effort parse: returns not_a_date_time if the string doesn't match supported formats.
 
-            // if day has single digit, then prepend it with zero
-            string dttz = m[1].str() + " " + (m[2].str()[1] == ' ' ? "0" : "") + m[2].str() + " " + m[3].str().substr(0, 12) + ":" + m[3].str().substr(12);
-            stringstream ss(dttz);
-            local_time_input_facet* facet = new local_time_input_facet("%a %d %b %Y %H:%M:%S %ZP");
-            ss.exceptions(std::ios_base::failbit);
-            ss.imbue(locale(ss.getloc(), facet));
-            local_date_time ldt(not_a_date_time);
-            ss >> ldt;
-            return ldt;
+        auto normalize_zone_to_offset = [](string z) -> string
+        {
+            z = trim_copy(z);
+            if (z.empty())
+                return "+00:00";
+            // Numeric zone: +HHMM / -HHMM -> +HH:MM / -HH:MM
+            if ((z.front() == '+' || z.front() == '-') && z.size() == 5)
+            {
+                bool digits = true;
+                for (size_t i = 1; i < z.size(); i++)
+                    digits = digits && std::isdigit(static_cast<unsigned char>(z[i])) != 0;
+                if (digits)
+                    return z.substr(0, 3) + ":" + z.substr(3, 2);
+            }
+            // Obsolete named zones (RFC 5322 obs-zone); map to numeric offsets.
+            const string zl = boost::to_lower_copy(z);
+            if (zl == "ut" || zl == "utc" || zl == "gmt")
+                return "+00:00";
+            if (zl == "est") return "-05:00";
+            if (zl == "edt") return "-04:00";
+            if (zl == "cst") return "-06:00";
+            if (zl == "cdt") return "-05:00";
+            if (zl == "mst") return "-07:00";
+            if (zl == "mdt") return "-06:00";
+            if (zl == "pst") return "-08:00";
+            if (zl == "pdt") return "-07:00";
+            // Unknown named zone: best-effort fallback to GMT.
+            return "+00:00";
+        };
+
+        auto strip_comments = [](const string& in) -> string
+        {
+            string out;
+            int depth = 0;
+            for (char c : in)
+            {
+                if (c == '(')
+                {
+                    depth++;
+                    continue;
+                }
+                if (c == ')' && depth > 0)
+                {
+                    depth--;
+                    continue;
+                }
+                if (depth == 0)
+                    out.push_back(c);
+            }
+            return out;
+        };
+
+        const string s = trim_copy(strip_comments(date_str));
+
+        // day-of-week is optional; comments / extra tokens may follow the zone
+        static const regex r(
+            R"(^\s*(?:[A-Za-z]{3}[\ \t]*,)?[\ \t]*(\d{1,2})[\ \t]+([A-Za-z]{3})[\ \t]+(\d{2,4})[\ \t]+(\d{2}:\d{2}(?::\d{2})?)(?:[\ \t]+([A-Za-z]{1,5}|[\+\-]\d{4}))?(?:[\ \t]+.*)?$)"
+        );
+
+        smatch m;
+        if (!regex_match(s, m, r))
+            return local_date_time(not_a_date_time);
+
+        // Normalize day to two digits (e.g. "7" -> "07")
+        string day = m[1].str();
+        if (day.size() == 1)
+            day = "0" + day;
+
+        const string mon  = m[2].str();
+        string year = m[3].str();
+        string tod  = m[4].str();
+        const string zone = m[5].matched ? m[5].str() : "";
+
+        // Handle 2/3-digit years (RFC 2822 obs-year corrections)
+        if (year.size() < 4)
+        {
+            try {
+                int y = std::stoi(year);
+                if (year.size() == 2 && y < 50)
+                    y += 2000;
+                else
+                    y += 1900;
+                year = std::to_string(y);
+            } catch (...) {
+                // If conversion fails, let the date parsing failing later
+            }
         }
-        return local_date_time(not_a_date_time);
+
+        // Handle missing seconds (RFC 5322 allows missing seconds)
+        if (tod.size() == 5)
+            tod += ":00";
+
+        // Parse date+time (without zone) into ptime.
+        // Month names are expected in English abbreviations per RFC examples.
+        const string dt = day + " " + mon + " " + year + " " + tod;
+        std::istringstream dss(dt);
+        dss.exceptions(std::ios_base::failbit);
+        auto* dt_facet = new boost::posix_time::time_input_facet("%d %b %Y %H:%M:%S");
+        dss.imbue(locale(dss.getloc(), dt_facet));
+        ptime pt;
+        dss >> pt;
+        const string offset = normalize_zone_to_offset(zone);
+        if (offset.empty())
+            return local_date_time(not_a_date_time);
+
+        time_zone_ptr tz(new posix_time_zone(offset));
+        return local_date_time(pt.date(), pt.time_of_day(), tz, false);
+        
     }
     catch (...)
     {

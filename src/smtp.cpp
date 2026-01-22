@@ -207,6 +207,7 @@ string smtp::submit(const message& msg)
     if (!positive_completion(std::get<0>(tokens)))
         throw smtp_error("Mail message rejection.", std::get<2>(tokens));
     return std::get<2>(tokens);
+    
 }
 
 

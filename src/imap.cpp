@@ -2694,6 +2694,14 @@ auto imap::list_folders(const list<string>& folder_name) -> mailbox_folder_t
     return list_folders(folder_name_s);
 }
 
+void imap::clear_capabilities()
+{
+    capabilities_cache_.clear();
+    capabilities_cached_ = false;
+    special_use_by_attr_cache_.clear();
+    special_use_by_attr_cached_ = false;
+}
+
 auto imap::list_special_use(bool only_special) -> special_use_map_t
 {
     // Ensure delimiter is known so that later callers can split names if they wish.
@@ -2784,7 +2792,9 @@ auto imap::list_special_use(bool only_special) -> special_use_map_t
                                     {
                                         if (iequals(attr, "\\All") || iequals(attr, "\\Archive") || iequals(attr, "\\Drafts") ||
                                             iequals(attr, "\\Flagged") || iequals(attr, "\\Junk") || iequals(attr, "\\Sent") ||
-                                            iequals(attr, "\\Trash") || iequals(attr, "\\Important"))
+                                            iequals(attr, "\\Trash") || iequals(attr, "\\Important") ||
+                                            iequals(attr, "\\Contacts") || iequals(attr, "\\Tasks") ||
+                                            iequals(attr, "\\Notes") || iequals(attr, "\\Journal"))
                                         {
                                             special_attrs.push_back(attr);
                                         }
@@ -3163,7 +3173,11 @@ auto imap::list_folders_high_level() -> high_level_folders_list_t
             if (special_it != special_by_mailbox.end())
                 attrs.insert(attrs.end(), special_it->second.begin(), special_it->second.end());
 
-            if (folder.selectable)
+            // skip Microsoft Outlook special folders that are not message folders.
+            bool is_non_message = has_attr(attrs, "\\Contacts") || has_attr(attrs, "\\Tasks") ||
+                                   has_attr(attrs, "\\Notes") || has_attr(attrs, "\\Journal");
+
+            if (folder.selectable && !is_non_message)
             {
                 auto type = determine_type(attrs, path);
                 bool is_virtual = (type == mailbox_folder_type_t::ALL ||

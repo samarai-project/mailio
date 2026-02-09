@@ -924,6 +924,16 @@ public:
     const std::vector<std::string>& capabilities();
 
     /**
+    Clear cached CAPABILITY tokens and SPECIAL-USE mappings so the next call
+    to `capabilities()` or `list_special_use_by_attr()` re-queries the server.
+
+    Some servers (e.g. Microsoft Exchange / Outlook) only advertise certain
+    capabilities such as SPECIAL-USE after authentication.  Call this method
+    once after login completes so that subsequent queries see the full set.
+    */
+    void clear_capabilities();
+
+    /**
     Issue RFC 5161 ENABLE with a list of extensions to activate.
 
     Sends: ENABLE <ext1> <ext2> ... and waits for the tagged OK.

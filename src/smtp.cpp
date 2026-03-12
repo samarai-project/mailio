@@ -288,13 +288,6 @@ void smtp::auth_login_xoauth2(const std::string &username, const std::string &ac
     std::string sasl = "user=" + username + "\x01" + "auth=Bearer " + access_token + "\x01\x01";
     std::string sasl_b64 = b64_encode(sasl, static_cast<string::size_type>(codec::line_len_policy_t::NONE));
 
-    // Local sanity checks and helpful debug breadcrumbs.
-    auto has_crlf = (sasl.find('\r') != std::string::npos) || (sasl.find('\n') != std::string::npos);
-    auto has_other_ctrl = std::any_of(sasl.begin(), sasl.end(), [](unsigned char ch)
-    {
-        return (ch < 0x20) && (ch != 0x01) && (ch != 0x09); // allow HT and the SASL \x01 separators
-    });
-
     auto evaluate = [this](const tuple<int, bool, string>& tokens)
     {
         if (positive_completion(std::get<0>(tokens)))

@@ -592,10 +592,6 @@ void imap::fetch(const list<messages_range_t>& messages_range, map<unsigned long
     
     // Flag whether the response line is the last one i.e. the tagged response.
     bool has_more = true;
-    // Determine if the caller asked for exactly one message id (seq or uid), not a range/open-ended.
-    const bool is_single_fetch = (messages_range.size() == 1) &&
-        (messages_range.front().second.has_value()) &&
-        (messages_range.front().first == messages_range.front().second.value());
     try
     {
         while (has_more)

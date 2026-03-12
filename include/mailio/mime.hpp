@@ -874,7 +874,6 @@ protected:
     /**
     Codec used for headers.
     **/
-    [[deprecated]]
     header_codec_t header_codec_;
 
     /**
